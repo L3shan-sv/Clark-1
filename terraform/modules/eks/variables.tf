@@ -1,0 +1,14 @@
+variable "cluster_name" { type = string }
+variable "cluster_version" { type = string }
+variable "vpc_id" { type = string }
+variable "private_subnet_ids" { type = list(string) }
+variable "intra_subnet_ids" { type = list(string) }
+variable "system_node_instance_types" { type = list(string) }
+variable "system_node_min_size" { type = number }
+variable "system_node_max_size" { type = number }
+variable "app_node_instance_types" { type = list(string) }
+variable "app_node_min_size" { type = number }
+variable "app_node_max_size" { type = number }
+variable "observability_node_instance_types" { type = list(string) }
+variable "observability_node_min_size" { type = number }
+variable "observability_node_max_size" { type = number }
