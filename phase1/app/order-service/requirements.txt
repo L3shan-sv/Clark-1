@@ -1,0 +1,19 @@
+# order-service/requirements.txt
+# Only order-service dependencies — no extras
+
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+httpx==0.26.0              # calls payment-service
+redis[asyncio]==5.0.1
+aiokafka==0.10.0
+structlog==24.1.0
+prometheus-client==0.19.0
+
+# OpenTelemetry
+opentelemetry-sdk==1.22.0
+opentelemetry-api==1.22.0
+opentelemetry-exporter-otlp-proto-grpc==1.22.0
+opentelemetry-instrumentation-fastapi==0.43b0
+opentelemetry-instrumentation-httpx==0.43b0
+opentelemetry-instrumentation-redis==0.43b0
