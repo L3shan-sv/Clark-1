@@ -1,0 +1,257 @@
+# alerts/infrastructure-alerts.yaml
+# Non-SLO alerts — symptom-based alerts for infrastructure issues.
+# These complement the SLO burn rate alerts.
+# Rule: every alert must have a runbook. No runbook = no alert.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: infrastructure-alerts
+  namespace: observability
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+
+    # ── Pod Health ─────────────────────────────────────────────────────────────
+
+    - name: pod.health
+      rules:
+
+        - alert: PodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{namespace="app"}[15m]) * 60 * 15 > 5
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+            remediation: auto   # Argo workflow will handle this
+          annotations:
+            summary: "🔄 Pod {{ $labels.pod }} is crash looping"
+            description: |
+              Pod {{ $labels.pod }} in namespace {{ $labels.namespace }}
+              has restarted {{ $value | humanize }} times in the last 15 minutes.
+              Automated remediation workflow will trigger in 5 minutes if not resolved.
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/high-error-rate.md"
+
+        - alert: PodNotReady
+          expr: |
+            sum by (pod, namespace) (
+              kube_pod_status_ready{condition="true", namespace="app"}
+            ) == 0
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⚠️ Pod {{ $labels.pod }} not ready for 10 minutes"
+            description: "Pod {{ $labels.pod }} has been in non-ready state for 10+ minutes."
+
+        - alert: PodOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{reason="OOMKilled", namespace="app"} == 1
+          for: 0m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "💀 Pod {{ $labels.pod }} OOMKilled"
+            description: |
+              Container {{ $labels.container }} in pod {{ $labels.pod }} was OOMKilled.
+              Consider increasing memory limits.
+
+        - alert: PodPendingTooLong
+          expr: |
+            sum by (pod, namespace) (
+              kube_pod_status_phase{phase="Pending", namespace="app"}
+            ) > 0
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⏳ Pod {{ $labels.pod }} stuck in Pending for 15 minutes"
+            description: |
+              Pod {{ $labels.pod }} has been Pending for 15+ minutes.
+              Possible causes: insufficient cluster capacity, image pull failure, unschedulable.
+
+    # ── Deployment Health ──────────────────────────────────────────────────────
+
+    - name: deployment.health
+      rules:
+
+        - alert: DeploymentReplicasMismatch
+          expr: |
+            kube_deployment_spec_replicas{namespace="app"}
+            !=
+            kube_deployment_status_replicas_available{namespace="app"}
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⚠️ Deployment {{ $labels.deployment }} has fewer replicas than desired"
+            description: |
+              Deployment {{ $labels.deployment }} wants {{ $value }} replicas
+              but has fewer available for 10+ minutes.
+
+        - alert: DeploymentRolloutStuck
+          expr: |
+            kube_deployment_status_condition{condition="Progressing", status="False", namespace="app"} == 1
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "🚨 Deployment {{ $labels.deployment }} rollout stuck"
+            description: |
+              Deployment {{ $labels.deployment }} rollout is not progressing.
+              Check: kubectl rollout status deployment/{{ $labels.deployment }} -n app
+
+    # ── Node Health ────────────────────────────────────────────────────────────
+
+    - name: node.health
+      rules:
+
+        - alert: NodeNotReady
+          expr: |
+            kube_node_status_condition{condition="Ready", status="true"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "🚨 Node {{ $labels.node }} is NotReady"
+            description: "Node {{ $labels.node }} has been NotReady for 5 minutes."
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/node-disk-pressure.md"
+
+        - alert: NodeDiskPressureHigh
+          expr: |
+            (
+              node_filesystem_size_bytes{mountpoint="/"}
+              - node_filesystem_free_bytes{mountpoint="/"}
+            ) / node_filesystem_size_bytes{mountpoint="/"} > 0.80
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "💾 Node {{ $labels.instance }} disk usage > 80%"
+            description: |
+              Node {{ $labels.instance }} disk is {{ $value | humanizePercentage }} full.
+              At 90% Kubernetes will start evicting pods.
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/node-disk-pressure.md"
+
+        - alert: NodeDiskPressureCritical
+          expr: |
+            (
+              node_filesystem_size_bytes{mountpoint="/"}
+              - node_filesystem_free_bytes{mountpoint="/"}
+            ) / node_filesystem_size_bytes{mountpoint="/"} > 0.90
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "🚨 Node {{ $labels.instance }} disk > 90% — evictions imminent"
+            description: "Kubernetes will start evicting pods from {{ $labels.instance }} immediately."
+
+        - alert: NodeMemoryPressureHigh
+          expr: |
+            (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.90
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "🧠 Node {{ $labels.instance }} memory > 90%"
+            description: "Node memory is {{ $value | humanizePercentage }} used. OOMKill risk."
+
+        - alert: NodeCPUHighSustained
+          expr: |
+            100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⚡ Node {{ $labels.instance }} CPU > 90% for 15 minutes"
+            description: "Sustained high CPU. Pods may be throttled. Consider scaling."
+
+    # ── Redis Health ───────────────────────────────────────────────────────────
+
+    - name: redis.health
+      rules:
+
+        - alert: RedisMemoryHigh
+          expr: |
+            redis_memory_used_bytes / redis_memory_max_bytes > 0.85
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+            remediation: auto
+          annotations:
+            summary: "🔴 Redis memory usage > 85%"
+            description: |
+              Redis memory: {{ $value | humanizePercentage }} of max.
+              Automated remediation will adjust eviction policy.
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/redis-memory-pressure.md"
+
+        - alert: RedisMemoryCritical
+          expr: |
+            redis_memory_used_bytes / redis_memory_max_bytes > 0.95
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "🚨 Redis memory critical — writes may fail"
+            description: "Redis at {{ $value | humanizePercentage }} of max memory. Immediate action required."
+
+        - alert: RedisRejectedConnections
+          expr: |
+            rate(redis_rejected_connections_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "🚨 Redis rejecting connections"
+            description: "Redis is rejecting {{ $value | humanize }} connections/sec. maxclients may be hit."
+
+    # ── HPA / Autoscaling ──────────────────────────────────────────────────────
+
+    - name: autoscaling.health
+      rules:
+
+        - alert: HPAMaxReplicasReached
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas{namespace="app"}
+            ==
+            kube_horizontalpodautoscaler_spec_max_replicas{namespace="app"}
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "📈 HPA {{ $labels.horizontalpodautoscaler }} at max replicas"
+            description: |
+              HPA {{ $labels.horizontalpodautoscaler }} has been at max replicas for 10 minutes.
+              Traffic may be exceeding cluster capacity. Consider increasing maxReplicas.
+
+        - alert: HPAUnableToScale
+          expr: |
+            kube_horizontalpodautoscaler_status_condition{
+              condition="AbleToScale",
+              status="False",
+              namespace="app"
+            } == 1
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⚠️ HPA {{ $labels.horizontalpodautoscaler }} unable to scale"
+            description: "HPA cannot scale. Check cluster capacity and node group limits."
