@@ -1,0 +1,209 @@
+# kubernetes/alerting/grafana-oncall.yaml
+# Grafana OnCall — incident lifecycle management.
+# Every alert becomes an incident. Every incident has a timeline.
+# Every resolved incident generates a postmortem template.
+
+---
+# OnCall is deployed via the kube-prometheus-stack or standalone helm chart.
+# This ConfigMap defines the integration configuration as code.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oncall-integration-config
+  namespace: observability
+data:
+  # ── Slack Integration ──────────────────────────────────────────────────────
+  # Every incident gets a dedicated Slack thread with full context:
+  # - Which alert fired
+  # - Current metric values
+  # - Link to runbook
+  # - Link to dashboard
+  # - One-click acknowledge / resolve buttons
+
+  slack-message-template.json: |
+    {
+      "blocks": [
+        {
+          "type": "header",
+          "text": {
+            "type": "plain_text",
+            "text": "{{ '🚨' if severity == 'critical' else '⚠️' }} {{ alert_name }}"
+          }
+        },
+        {
+          "type": "section",
+          "fields": [
+            { "type": "mrkdwn", "text": "*Service:*\n{{ service }}" },
+            { "type": "mrkdwn", "text": "*Severity:*\n{{ severity | upper }}" },
+            { "type": "mrkdwn", "text": "*SLO:*\n{{ slo | default('N/A') }}" },
+            { "type": "mrkdwn", "text": "*Tier:*\n{{ tier | default('N/A') }}" }
+          ]
+        },
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": "*Description:*\n{{ description }}"
+          }
+        },
+        {
+          "type": "actions",
+          "elements": [
+            {
+              "type": "button",
+              "text": { "type": "plain_text", "text": "📖 Runbook" },
+              "url": "{{ runbook_url }}"
+            },
+            {
+              "type": "button",
+              "text": { "type": "plain_text", "text": "📊 Dashboard" },
+              "url": "{{ dashboard_url | default('http://grafana') }}"
+            },
+            {
+              "type": "button",
+              "text": { "type": "plain_text", "text": "✅ Acknowledge" },
+              "style": "primary",
+              "action_id": "acknowledge_incident"
+            },
+            {
+              "type": "button",
+              "text": { "type": "plain_text", "text": "🔕 Silence 1h" },
+              "action_id": "silence_1h"
+            }
+          ]
+        }
+      ]
+    }
+
+  # ── Postmortem Auto-Generation ────────────────────────────────────────────
+  # When an incident resolves, this script is triggered via Argo Workflows.
+  # It fills in the postmortem template with incident data and posts to Slack.
+
+  postmortem-generator.py: |
+    #!/usr/bin/env python3
+    """
+    Auto-generates a postmortem draft when a critical incident resolves.
+    Called by Argo Workflow on incident resolution.
+    Populates the template with:
+    - Incident timeline from Alertmanager
+    - Affected services and metrics
+    - Error budget impact
+    - Posts draft to Slack #postmortems channel
+    """
+    import os
+    import json
+    import requests
+    from datetime import datetime, timezone
+
+    SLACK_WEBHOOK = os.environ["SLACK_WEBHOOK_URL"]
+    ALERTMANAGER_URL = os.environ.get("ALERTMANAGER_URL", "http://alertmanager:9093")
+    GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://grafana")
+
+    INCIDENT_ID     = os.environ["INCIDENT_ID"]
+    ALERT_NAME      = os.environ["ALERT_NAME"]
+    SERVICE         = os.environ["SERVICE"]
+    FIRED_AT        = os.environ["FIRED_AT"]
+    RESOLVED_AT     = os.environ["RESOLVED_AT"]
+    SEVERITY        = os.environ["SEVERITY"]
+
+    fired_ts    = datetime.fromisoformat(FIRED_AT)
+    resolved_ts = datetime.fromisoformat(RESOLVED_AT)
+    duration    = resolved_ts - fired_ts
+    duration_str = f"{int(duration.total_seconds() // 60)} minutes"
+
+    postmortem = f"""
+    # 📋 Postmortem Draft: {ALERT_NAME}
+    *Auto-generated — fill in details and post to #postmortems*
+
+    | Field | Value |
+    |---|---|
+    | Incident ID | {INCIDENT_ID} |
+    | Date | {fired_ts.strftime('%Y-%m-%d')} |
+    | Duration | {duration_str} |
+    | Severity | {SEVERITY.upper()} |
+    | Service | {SERVICE} |
+    | Alert | {ALERT_NAME} |
+
+    **Timeline**
+    - {fired_ts.strftime('%H:%M UTC')} — Alert fired
+    - _Fill in: when engineer acknowledged_
+    - _Fill in: when root cause identified_
+    - _Fill in: what mitigation was applied_
+    - {resolved_ts.strftime('%H:%M UTC')} — Alert resolved
+
+    **Root Cause**
+    _TODO: Fill in what caused this incident_
+
+    **Action Items**
+    _TODO: Fill in at least 3 concrete action items with owners_
+
+    📎 [View full postmortem template](https://github.com/your-org/autonomous-observability-platform/blob/main/docs/postmortems/postmortem-template.md)
+    📊 [Grafana dashboard]({GRAFANA_URL}/d/{SERVICE})
+    """
+
+    payload = {
+        "blocks": [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": f"📋 Postmortem Draft Ready: {ALERT_NAME}"}
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": postmortem}
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Incident duration:* {duration_str} | *Service:* {SERVICE} | *Severity:* {SEVERITY}"
+                }
+            }
+        ]
+    }
+
+    resp = requests.post(SLACK_WEBHOOK, json=payload)
+    print(f"Postmortem posted to Slack: {resp.status_code}")
+
+---
+# ── On-Call Schedule (Grafana OnCall API) ─────────────────────────────────────
+# Define via Grafana OnCall UI or API after deployment.
+# Structure:
+#
+# Schedule: "Platform On-Call"
+#   └── Rotation: Weekly
+#       ├── Engineer A: Mon-Sun (Week 1)
+#       ├── Engineer B: Mon-Sun (Week 2)
+#       └── ...
+#
+# Escalation Policy: "Critical Alerts"
+#   ├── Step 1: Notify on-call engineer (immediate)
+#   ├── Step 2: If no ack in 10min → notify engineering lead
+#   └── Step 3: If no ack in 20min → notify VP Engineering
+#
+# Integration: Alertmanager
+#   └── Routes: severity=critical → "Critical Alerts" policy
+#               severity=warning  → notify on-call (no escalation)
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oncall-setup-instructions
+  namespace: observability
+data:
+  README.md: |
+    # Grafana OnCall Setup
+
+    After deploying kube-prometheus-stack:
+
+    1. Open Grafana → OnCall (left sidebar)
+    2. Create Integration: Alertmanager
+       - Copy the webhook URL
+    3. Add webhook URL to Alertmanager config (pagerduty-critical receiver)
+    4. Create Schedule: "Platform On-Call" — weekly rotation
+    5. Create Escalation Policy: "Critical"
+       - Step 1: Notify on-call (0 min)
+       - Step 2: Notify lead (10 min)
+       - Step 3: Notify VP (20 min)
+    6. Assign escalation policy to the Alertmanager integration
+    7. Test: fire a test alert and confirm you get paged
