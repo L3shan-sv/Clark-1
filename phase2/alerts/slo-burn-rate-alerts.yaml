@@ -1,0 +1,312 @@
+# alerts/slo-burn-rate-alerts.yaml
+# Multi-window burn rate alerting — Google SRE Workbook Chapter 5.
+#
+# Why multi-window?
+# Single window alerts have two problems:
+#   - Short windows: too many false positives (a 1-minute blip fires a page)
+#   - Long windows: too slow to detect fast burns that exhaust budget in hours
+#
+# Multi-window solves this:
+#   - Long window: confirms the burn is sustained (not a blip)
+#   - Short window: confirms the burn is still happening RIGHT NOW
+# Both windows must be true simultaneously → much higher signal-to-noise.
+#
+# Burn rate meaning:
+#   burn_rate = 1  → consuming error budget at exactly the rate that exhausts it in 30 days
+#   burn_rate = 14 → consuming 14x faster → budget exhausted in ~2 days
+#   burn_rate = 720 → consuming 720x faster → budget exhausted in 1 hour
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: slo-burn-rate-alerts
+  namespace: observability
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ORDER SERVICE — AVAILABILITY
+    # SLO: 99.9% — error budget: 43.2 min/month
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: slo.order-service.availability.alerts
+      rules:
+
+        # CRITICAL — burn rate 14.4x → budget gone in ~2 hours
+        # Both windows must fire: sustained burn confirmed
+        - alert: OrderServiceAvailabilityCritical
+          expr: |
+            (
+              (1 - slo:order_service_availability:ratio_rate1h) > (14.4 * 0.001)
+            )
+            and
+            (
+              (1 - slo:order_service_availability:ratio_rate5m) > (14.4 * 0.001)
+            )
+          for: 2m
+          labels:
+            severity: critical
+            tier: "1"
+            service: order-service
+            slo: availability
+            team: platform
+          annotations:
+            summary: "🚨 Order service error budget burning critically fast"
+            description: |
+              Order service availability SLO is burning at {{ $value | humanizePercentage }} error rate.
+              At this burn rate the monthly error budget (43.2 min) will be exhausted in ~2 hours.
+              Current availability: {{ 1 - $value | humanizePercentage }}
+              Target: 99.9%
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/high-error-rate.md"
+            dashboard_url: "http://grafana/d/order-service"
+
+        # WARNING — burn rate 6x → budget gone in ~5 days
+        - alert: OrderServiceAvailabilityWarning
+          expr: |
+            (
+              (1 - slo:order_service_availability:ratio_rate6h) > (6 * 0.001)
+            )
+            and
+            (
+              (1 - slo:order_service_availability:ratio_rate30m) > (6 * 0.001)
+            )
+          for: 15m
+          labels:
+            severity: warning
+            tier: "1"
+            service: order-service
+            slo: availability
+            team: platform
+          annotations:
+            summary: "⚠️ Order service error budget burning faster than expected"
+            description: |
+              Order service is burning error budget at 6x the expected rate.
+              Budget will be exhausted in ~5 days if this continues.
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/high-error-rate.md"
+
+        # TICKET — burn rate 3x → budget gone in ~10 days
+        - alert: OrderServiceAvailabilityTicket
+          expr: |
+            (
+              (1 - slo:order_service_availability:ratio_rate3d) > (3 * 0.001)
+            )
+            and
+            (
+              (1 - slo:order_service_availability:ratio_rate6h) > (3 * 0.001)
+            )
+          for: 1h
+          labels:
+            severity: ticket
+            tier: "1"
+            service: order-service
+            slo: availability
+            team: platform
+          annotations:
+            summary: "🎫 Order service error budget slowly depleting"
+            description: |
+              Order service error budget will be exhausted in ~10 days at current burn rate.
+              File a ticket and address this week.
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ORDER SERVICE — LATENCY
+    # SLO: 95% of requests under 200ms
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: slo.order-service.latency.alerts
+      rules:
+
+        - alert: OrderServiceLatencyCritical
+          expr: |
+            (
+              slo:order_service_latency_200ms:ratio_rate1h < (1 - 14.4 * 0.05)
+            )
+            and
+            (
+              slo:order_service_latency_200ms:ratio_rate5m < (1 - 14.4 * 0.05)
+            )
+          for: 2m
+          labels:
+            severity: critical
+            tier: "1"
+            service: order-service
+            slo: latency
+            team: platform
+          annotations:
+            summary: "🚨 Order service latency SLO burning critically"
+            description: |
+              Less than {{ $value | humanizePercentage }} of order requests are completing under 200ms.
+              Target: 95%. Error budget will be exhausted in ~2 hours.
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/high-latency.md"
+
+        - alert: OrderServiceLatencyWarning
+          expr: |
+            (
+              slo:order_service_latency_200ms:ratio_rate6h < (1 - 6 * 0.05)
+            )
+            and
+            (
+              slo:order_service_latency_200ms:ratio_rate30m < (1 - 6 * 0.05)
+            )
+          for: 15m
+          labels:
+            severity: warning
+            tier: "1"
+            service: order-service
+            slo: latency
+          annotations:
+            summary: "⚠️ Order service latency SLO degrading"
+            description: "Latency SLO burning at 6x expected rate."
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PAYMENT SERVICE — AVAILABILITY
+    # SLO: 99.95% — tighter than order service (revenue impact)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: slo.payment-service.availability.alerts
+      rules:
+
+        - alert: PaymentServiceAvailabilityCritical
+          expr: |
+            (
+              (1 - slo:payment_service_availability:ratio_rate1h) > (14.4 * 0.0005)
+            )
+            and
+            (
+              (1 - slo:payment_service_availability:ratio_rate5m) > (14.4 * 0.0005)
+            )
+          for: 2m
+          labels:
+            severity: critical
+            tier: "1"
+            service: payment-service
+            slo: availability
+            team: platform
+            pagerduty: "true"        # Payment failures get PagerDuty
+          annotations:
+            summary: "🚨 PAYMENT SERVICE DOWN — Revenue impact active"
+            description: |
+              Payment service error rate: {{ $value | humanizePercentage }}
+              SLO target: 99.95%. Error budget exhausted in ~2 hours.
+              REVENUE IS BEING LOST. Page the on-call engineer immediately.
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/high-error-rate.md"
+
+        - alert: PaymentServiceAvailabilityWarning
+          expr: |
+            (
+              (1 - slo:payment_service_availability:ratio_rate6h) > (6 * 0.0005)
+            )
+            and
+            (
+              (1 - slo:payment_service_availability:ratio_rate30m) > (6 * 0.0005)
+            )
+          for: 15m
+          labels:
+            severity: warning
+            tier: "1"
+            service: payment-service
+            slo: availability
+          annotations:
+            summary: "⚠️ Payment service error budget burning"
+            description: "Payment service availability degrading — investigate before it becomes critical."
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TIER 2 — DEPENDENCIES
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: slo.dependencies.alerts
+      rules:
+
+        - alert: RedisAvailabilityDegraded
+          expr: |
+            slo:node_availability:ratio_rate5m < 0.9995
+          for: 5m
+          labels:
+            severity: critical
+            tier: "2"
+            service: redis
+          annotations:
+            summary: "🚨 Redis availability below SLO"
+            description: "Redis availability has dropped below 99.95% SLO target."
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/redis-memory-pressure.md"
+
+        - alert: KafkaConsumerLagHigh
+          expr: |
+            slo:kafka_consumer_lag:max > 30000
+          for: 10m
+          labels:
+            severity: warning
+            tier: "2"
+            service: kafka
+          annotations:
+            summary: "⚠️ Kafka consumer lag exceeding 30s SLO"
+            description: |
+              Consumer group {{ $labels.consumergroup }} on topic {{ $labels.topic }}
+              has lag of {{ $value }} messages — exceeding 30 second SLO.
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/kafka-consumer-lag.md"
+
+        - alert: KafkaConsumerLagCritical
+          expr: |
+            slo:kafka_consumer_lag:max > 100000
+          for: 5m
+          labels:
+            severity: critical
+            tier: "2"
+            service: kafka
+          annotations:
+            summary: "🚨 Kafka consumer lag critically high"
+            description: |
+              Consumer group {{ $labels.consumergroup }} lag: {{ $value }} messages.
+              Notifications and analytics are severely delayed.
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TIER 3 — INFRASTRUCTURE
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: slo.infrastructure.alerts
+      rules:
+
+        - alert: NodeAvailabilityDegraded
+          expr: |
+            slo:node_availability:ratio_rate5m < 0.9999
+          for: 5m
+          labels:
+            severity: critical
+            tier: "3"
+            service: eks-nodes
+          annotations:
+            summary: "🚨 EKS node availability below 99.99% SLO"
+            description: "Node availability: {{ $value | humanizePercentage }}. Target: 99.99%."
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/node-disk-pressure.md"
+
+        - alert: PodRestartRateHigh
+          expr: |
+            slo:pod_restart_rate:rate1h > 1
+          for: 5m
+          labels:
+            severity: warning
+            tier: "3"
+            service: all-pods
+          annotations:
+            summary: "⚠️ Pod restart rate exceeding SLO (>1/hour)"
+            description: |
+              {{ $value }} pod restarts in the last hour across the app namespace.
+              SLO target: < 1 per hour.
+
+        # Error budget exhaustion alert — fires when budget is nearly gone
+        - alert: ErrorBudgetNearlyExhausted
+          expr: |
+            slo:order_service_availability:error_budget_remaining < 0.10
+            or
+            slo:payment_service_availability:error_budget_remaining < 0.10
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "🚨 Error budget < 10% remaining this month"
+            description: |
+              A service has less than 10% of its monthly error budget remaining.
+              Deployment freeze should be considered per error budget policy.

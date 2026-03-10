@@ -1,0 +1,267 @@
+# kubernetes/observability/kube-prometheus-stack-values.yaml
+# Production-grade Prometheus stack configuration.
+# Deploy with: helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#   -n observability -f kube-prometheus-stack-values.yaml
+
+prometheus:
+  prometheusSpec:
+    # Retain 15 days locally — long-term storage goes to Thanos/S3
+    retention: 15d
+    retentionSize: "50GB"
+
+    # Run on observability node group only
+    nodeSelector:
+      role: observability
+    tolerations:
+      - key: observability
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+
+    # High-availability: 2 replicas
+    replicas: 2
+
+    # Persistent storage
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 100Gi
+
+    # Resource limits — Prometheus is memory hungry
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "2Gi"
+      limits:
+        cpu: "2000m"
+        memory: "8Gi"
+
+    # Scrape all PodMonitors and ServiceMonitors
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+
+    # Remote write to Thanos for long-term storage (configure endpoint)
+    # remoteWrite:
+    #   - url: http://thanos-receive.observability.svc.cluster.local:19291/api/v1/receive
+
+    # Extra scrape configs for services not using ServiceMonitors
+    additionalScrapeConfigs:
+      - job_name: 'app-services'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: ['app']
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: service
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+
+alertmanager:
+  alertmanagerSpec:
+    nodeSelector:
+      role: observability
+    tolerations:
+      - key: observability
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    replicas: 2
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+
+grafana:
+  enabled: true
+  replicas: 2
+
+  nodeSelector:
+    role: observability
+  tolerations:
+    - key: observability
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+
+  persistence:
+    enabled: true
+    storageClassName: gp3
+    size: 20Gi
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+  # Datasources — wired to Prometheus, Loki, Tempo
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      url: http://loki-gateway.observability.svc.cluster.local
+      jsonData:
+        maxLines: 1000
+        derivedFields:
+          - datasourceUid: Tempo
+            matcherRegex: '"trace_id":"(\w+)"'
+            name: TraceID
+            url: '$${__value.raw}'
+
+    - name: Tempo
+      type: tempo
+      url: http://tempo.observability.svc.cluster.local:3100
+      jsonData:
+        tracesToLogs:
+          datasourceUid: Loki
+          filterByTraceID: true
+          filterBySpanID: false
+        serviceMap:
+          datasourceUid: Prometheus
+        nodeGraph:
+          enabled: true
+
+  # Grafana config
+  grafana.ini:
+    server:
+      root_url: "%(protocol)s://%(domain)s/grafana"
+    auth:
+      disable_login_form: false
+    auth.anonymous:
+      enabled: false
+    alerting:
+      enabled: false   # Use Prometheus alerting, not Grafana alerting
+    unified_alerting:
+      enabled: false
+
+  # Admin credentials from secret
+  admin:
+    existingSecret: grafana-admin-credentials
+    userKey: admin-user
+    passwordKey: admin-password
+
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true
+
+---
+# kubernetes/observability/loki-values.yaml
+# Loki in simple scalable mode — S3 backend for durability
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-helm-values-reference
+  namespace: observability
+  annotations:
+    note: "Deploy with: helm upgrade --install loki grafana/loki -n observability -f loki-values.yaml"
+data:
+  values.yaml: |
+    loki:
+      commonConfig:
+        replication_factor: 1
+      storage:
+        type: s3
+        s3:
+          region: us-east-1
+          bucketNames:
+            chunks: autonomous-observability-loki-chunks
+            ruler: autonomous-observability-loki-ruler
+            admin: autonomous-observability-loki-admin
+      schemaConfig:
+        configs:
+          - from: "2024-01-01"
+            store: tsdb
+            object_store: s3
+            schema: v12
+            index:
+              prefix: loki_index_
+              period: 24h
+      limits_config:
+        retention_period: 30d
+        ingestion_rate_mb: 16
+        ingestion_burst_size_mb: 32
+
+    write:
+      replicas: 2
+      nodeSelector:
+        role: observability
+      tolerations:
+        - key: observability
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+    read:
+      replicas: 2
+      nodeSelector:
+        role: observability
+
+    backend:
+      replicas: 2
+      nodeSelector:
+        role: observability
+
+---
+# kubernetes/observability/tempo-values.yaml
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-helm-values-reference
+  namespace: observability
+  annotations:
+    note: "Deploy with: helm upgrade --install tempo grafana/tempo-distributed -n observability -f tempo-values.yaml"
+data:
+  values.yaml: |
+    storage:
+      trace:
+        backend: s3
+        s3:
+          bucket: autonomous-observability-tempo-traces
+          region: us-east-1
+
+    distributor:
+      replicas: 2
+      nodeSelector:
+        role: observability
+
+    ingester:
+      replicas: 2
+      nodeSelector:
+        role: observability
+
+    querier:
+      replicas: 2
+      nodeSelector:
+        role: observability
+
+    compactor:
+      replicas: 1
+      nodeSelector:
+        role: observability

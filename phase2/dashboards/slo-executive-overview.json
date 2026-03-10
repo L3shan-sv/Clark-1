@@ -1,0 +1,216 @@
+{
+  "uid": "slo-executive-overview",
+  "title": "Executive SLO Overview",
+  "description": "SLO status, error budgets, and burn rates across all tiers. The single pane of glass for reliability.",
+  "tags": ["slo", "executive", "reliability"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": { "from": "now-30d", "to": "now" },
+  "panels": [
+
+    {
+      "id": 1,
+      "title": "Overall System Health",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.95 },
+              { "color": "green", "value": 0.999 }
+            ]
+          },
+          "unit": "percentunit",
+          "mappings": []
+        }
+      },
+      "targets": [{
+        "expr": "min(slo:order_service_availability:ratio_rate1d, slo:payment_service_availability:ratio_rate1d)",
+        "legendFormat": "System Health"
+      }]
+    },
+
+    {
+      "id": 2,
+      "title": "Order Service — Availability SLO",
+      "type": "gauge",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "minVizValue": 0.99,
+        "maxVizValue": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.998 },
+              { "color": "green", "value": 0.999 }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0.99,
+          "max": 1
+        }
+      },
+      "targets": [{
+        "expr": "slo:order_service_availability:ratio_rate1d",
+        "legendFormat": "Order Service Availability"
+      }]
+    },
+
+    {
+      "id": 3,
+      "title": "Payment Service — Availability SLO",
+      "type": "gauge",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.999 },
+              { "color": "green", "value": 0.9995 }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0.999,
+          "max": 1
+        }
+      },
+      "targets": [{
+        "expr": "slo:payment_service_availability:ratio_rate1d",
+        "legendFormat": "Payment Service Availability"
+      }]
+    },
+
+    {
+      "id": 4,
+      "title": "Order Service — Error Budget Remaining",
+      "type": "bargauge",
+      "gridPos": { "x": 0, "y": 4, "w": 6, "h": 4 },
+      "description": "Monthly error budget consumed. Green = healthy, red = freeze deployments.",
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "percentage",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 25 },
+              { "color": "green", "value": 50 }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "targets": [{
+        "expr": "clamp_min(slo:order_service_availability:error_budget_remaining, 0)",
+        "legendFormat": "Order Service Budget"
+      }]
+    },
+
+    {
+      "id": 5,
+      "title": "Payment Service — Error Budget Remaining",
+      "type": "bargauge",
+      "gridPos": { "x": 6, "y": 4, "w": 6, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "percentage",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 25 },
+              { "color": "green", "value": 50 }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "targets": [{
+        "expr": "clamp_min(slo:payment_service_availability:error_budget_remaining, 0)",
+        "legendFormat": "Payment Service Budget"
+      }]
+    },
+
+    {
+      "id": 6,
+      "title": "Burn Rate — Order Service (1h window)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 6 },
+      "description": "Burn rate > 14.4 triggers Critical alert. > 6 triggers Warning.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": { "mode": "line" }
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "(1 - slo:order_service_availability:ratio_rate1h) / 0.001",
+          "legendFormat": "Burn Rate (1h)"
+        },
+        {
+          "expr": "(1 - slo:order_service_availability:ratio_rate6h) / 0.001",
+          "legendFormat": "Burn Rate (6h)"
+        }
+      ]
+    },
+
+    {
+      "id": 7,
+      "title": "SLO Status Table — All Services",
+      "type": "table",
+      "gridPos": { "x": 0, "y": 14, "w": 24, "h": 8 },
+      "options": {
+        "sortBy": [{ "displayName": "Tier", "desc": false }]
+      },
+      "targets": [
+        {
+          "expr": "slo:order_service_availability:ratio_rate1d",
+          "legendFormat": "order-service | availability | Tier 1"
+        },
+        {
+          "expr": "slo:order_service_latency_200ms:ratio_rate1d",
+          "legendFormat": "order-service | latency-200ms | Tier 1"
+        },
+        {
+          "expr": "slo:payment_service_availability:ratio_rate1d",
+          "legendFormat": "payment-service | availability | Tier 1"
+        },
+        {
+          "expr": "slo:node_availability:ratio_rate5m",
+          "legendFormat": "eks-nodes | availability | Tier 3"
+        }
+      ]
+    }
+  ]
+}

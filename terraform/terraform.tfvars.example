@@ -1,0 +1,27 @@
+# ── Copy this to terraform.tfvars and fill in your values ────────────────────
+# DO NOT commit terraform.tfvars to git — it contains environment-specific config
+
+aws_region   = "us-east-1"
+environment  = "prod"
+cluster_name = "autonomous-observability"
+
+# Your IAM user ARN — get it with: aws sts get-caller-identity --query Arn --output text
+cluster_admin_arns = [
+  "arn:aws:iam::YOUR_ACCOUNT_ID:user/YOUR_IAM_USER"
+]
+
+# Node sizing — scale down for dev to save cost
+# dev:  system m5.large x2, app t3.large x2, observability m5.xlarge x2
+# prod: system m5.large x2, app m5.xlarge x2, observability r5.xlarge x2
+
+system_node_instance_types = ["m5.large"]
+system_node_min_size       = 2
+system_node_max_size       = 4
+
+app_node_instance_types = ["m5.xlarge"]
+app_node_min_size       = 2
+app_node_max_size       = 10
+
+observability_node_instance_types = ["r5.xlarge"]
+observability_node_min_size       = 2
+observability_node_max_size       = 6

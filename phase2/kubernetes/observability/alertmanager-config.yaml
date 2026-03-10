@@ -1,0 +1,147 @@
+# kubernetes/observability/alertmanager-config.yaml
+# Alert routing tree — every alert has exactly one destination.
+# Philosophy: Critical = wake someone up. Warning = Slack. Ticket = Jira.
+
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: main-routing
+  namespace: observability
+spec:
+  route:
+    groupBy: ["alertname", "service", "tier"]
+    groupWait: 30s        # Wait 30s before sending first alert (batch related alerts)
+    groupInterval: 5m     # Wait 5m before sending updates on same group
+    repeatInterval: 4h    # Repeat if still firing after 4h
+    receiver: default-slack
+
+    routes:
+
+      # Critical + payment service → PagerDuty immediately
+      - matchers:
+          - name: severity
+            value: critical
+          - name: service
+            value: payment-service
+        receiver: pagerduty-payment
+        repeatInterval: 30m
+        continue: false
+
+      # All critical → PagerDuty
+      - matchers:
+          - name: severity
+            value: critical
+        receiver: pagerduty-critical
+        repeatInterval: 1h
+        continue: true     # Also send to Slack
+
+      # Warning → Slack #alerts-warning
+      - matchers:
+          - name: severity
+            value: warning
+        receiver: slack-warning
+        repeatInterval: 6h
+
+      # Ticket → Slack #alerts-ticket (low noise)
+      - matchers:
+          - name: severity
+            value: ticket
+        receiver: slack-ticket
+        repeatInterval: 24h
+
+      # Tier 1 alerts always also go to #slo-alerts channel
+      - matchers:
+          - name: tier
+            value: "1"
+        receiver: slack-slo
+        continue: true
+
+  inhibitRules:
+    # Don't page for symptoms when the root cause is already firing
+    # e.g. if a node is down, don't also alert for every pod on that node
+    - sourceMatch:
+        - name: alertname
+          value: NodeAvailabilityDegraded
+      targetMatch:
+        - name: tier
+          value: "1"
+      equal: ["cluster"]
+
+    # If payment service is critical, suppress warning
+    - sourceMatch:
+        - name: severity
+          value: critical
+        - name: service
+          value: payment-service
+      targetMatch:
+        - name: severity
+          value: warning
+        - name: service
+          value: payment-service
+      equal: ["service", "slo"]
+
+  receivers:
+
+    - name: default-slack
+      slackConfigs:
+        - apiURL:
+            name: slack-webhook-secret
+            key: webhook-url
+          channel: "#alerts"
+          title: '{{ template "slack.title" . }}'
+          text: '{{ template "slack.text" . }}'
+          sendResolved: true
+          color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+
+    - name: pagerduty-critical
+      pagerdutyConfigs:
+        - routingKey:
+            name: pagerduty-secret
+            key: routing-key
+          severity: critical
+          description: '{{ .CommonAnnotations.summary }}'
+          details:
+            runbook: '{{ .CommonAnnotations.runbook_url }}'
+            dashboard: '{{ .CommonAnnotations.dashboard_url }}'
+
+    - name: pagerduty-payment
+      pagerdutyConfigs:
+        - routingKey:
+            name: pagerduty-payment-secret
+            key: routing-key
+          severity: critical
+          description: '🚨 PAYMENT SERVICE — {{ .CommonAnnotations.summary }}'
+
+    - name: slack-warning
+      slackConfigs:
+        - apiURL:
+            name: slack-webhook-secret
+            key: webhook-url
+          channel: "#alerts-warning"
+          title: '⚠️ {{ .CommonLabels.service }} | {{ .CommonAnnotations.summary }}'
+          text: '{{ .CommonAnnotations.description }}'
+          sendResolved: true
+
+    - name: slack-ticket
+      slackConfigs:
+        - apiURL:
+            name: slack-webhook-secret
+            key: webhook-url
+          channel: "#alerts-ticket"
+          title: '🎫 {{ .CommonLabels.service }} | {{ .CommonAnnotations.summary }}'
+          text: '{{ .CommonAnnotations.description }}'
+          sendResolved: false   # Tickets don't auto-resolve in Slack
+
+    - name: slack-slo
+      slackConfigs:
+        - apiURL:
+            name: slack-webhook-secret
+            key: webhook-url
+          channel: "#slo-alerts"
+          title: 'SLO Alert: {{ .CommonLabels.service }}'
+          text: |
+            *SLO:* {{ .CommonLabels.slo }}
+            *Severity:* {{ .CommonLabels.severity }}
+            *Description:* {{ .CommonAnnotations.description }}
+            *Runbook:* {{ .CommonAnnotations.runbook_url }}
+          sendResolved: true

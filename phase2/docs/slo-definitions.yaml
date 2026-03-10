@@ -1,0 +1,216 @@
+# docs/slo-definitions.yaml
+# Formal SLO definitions — single source of truth.
+# These are the contracts we hold ourselves to.
+# Every alert, every dashboard, every error budget is derived from these.
+
+slos:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # TIER 1 — USER FACING
+  # These directly affect the end user experience.
+  # Breach these and real users are feeling pain.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - name: order-service-availability
+    tier: 1
+    service: order-service
+    description: >
+      Orders can be created and retrieved successfully.
+      A user who attempts to place an order should succeed
+      99.9% of the time over any 30-day window.
+    slo: 99.9
+    error_budget_minutes_per_month: 43.2
+    sli:
+      type: availability
+      good_events: |
+        sum(rate(order_service_requests_total{status_code!~"5.."}[5m]))
+      total_events: |
+        sum(rate(order_service_requests_total[5m]))
+    alerting:
+      critical:
+        burn_rate: 14.4
+        windows: ["1h", "5m"]
+        message: "Order service error budget will be exhausted in ~2 hours"
+      warning:
+        burn_rate: 6
+        windows: ["6h", "30m"]
+        message: "Order service error budget will be exhausted in ~5 days"
+      ticket:
+        burn_rate: 3
+        windows: ["3d", "6h"]
+        message: "Order service error budget will be exhausted in ~10 days"
+
+  - name: order-service-latency
+    tier: 1
+    service: order-service
+    description: >
+      95% of order creation requests complete within 200ms.
+      Users notice latency above 300ms — this SLO gives us headroom.
+    slo: 95.0
+    sli:
+      type: latency
+      threshold_ms: 200
+      good_events: |
+        sum(rate(order_service_request_duration_seconds_bucket{le="0.2",method="POST",endpoint="/orders"}[5m]))
+      total_events: |
+        sum(rate(order_service_request_duration_seconds_count{method="POST",endpoint="/orders"}[5m]))
+    alerting:
+      critical:
+        burn_rate: 14.4
+        windows: ["1h", "5m"]
+      warning:
+        burn_rate: 6
+        windows: ["6h", "30m"]
+
+  - name: payment-service-availability
+    tier: 1
+    service: payment-service
+    description: >
+      Payment processing succeeds 99.95% of the time.
+      Payment failures directly cost revenue — tighter SLO than order service.
+    slo: 99.95
+    error_budget_minutes_per_month: 21.6
+    sli:
+      type: availability
+      good_events: |
+        sum(rate(payment_service_requests_total{status_code!~"5.."}[5m]))
+      total_events: |
+        sum(rate(payment_service_requests_total[5m]))
+    alerting:
+      critical:
+        burn_rate: 14.4
+        windows: ["1h", "5m"]
+      warning:
+        burn_rate: 6
+        windows: ["6h", "30m"]
+
+  - name: payment-service-latency
+    tier: 1
+    service: payment-service
+    description: >
+      95% of payment requests complete within 500ms.
+      Payment processing involves external calls — wider budget than order service.
+    slo: 95.0
+    sli:
+      type: latency
+      threshold_ms: 500
+      good_events: |
+        sum(rate(payment_service_request_duration_seconds_bucket{le="0.5",method="POST",endpoint="/payments"}[5m]))
+      total_events: |
+        sum(rate(payment_service_request_duration_seconds_count{method="POST",endpoint="/payments"}[5m]))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # TIER 2 — DEPENDENCIES
+  # Internal infrastructure our services depend on.
+  # Breach these and Tier 1 SLOs are at risk.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - name: redis-availability
+    tier: 2
+    service: redis
+    description: >
+      Redis responds to operations successfully 99.95% of the time.
+      Used for session state and caching across all services.
+    slo: 99.95
+    sli:
+      type: availability
+      good_events: |
+        sum(rate(redis_commands_processed_total[5m]))
+      total_events: |
+        sum(rate(redis_commands_processed_total[5m])) + sum(rate(redis_rejected_connections_total[5m]))
+
+  - name: kafka-consumer-lag
+    tier: 2
+    service: kafka
+    description: >
+      Consumer lag for all consumer groups stays below 30 seconds.
+      High lag means notifications and analytics are falling behind real time.
+    slo: 99.5
+    sli:
+      type: latency
+      threshold_ms: 30000
+      good_events: |
+        sum(kafka_consumergroup_lag < 30000)
+      total_events: |
+        count(kafka_consumergroup_lag)
+
+  - name: database-query-latency
+    tier: 2
+    service: postgresql
+    description: >
+      99th percentile database query time stays below 50ms.
+      Slow queries cascade into slow API responses.
+    slo: 99.0
+    sli:
+      type: latency
+      threshold_ms: 50
+      good_events: |
+        sum(rate(pg_stat_statements_total_time_seconds_bucket{le="0.05"}[5m]))
+      total_events: |
+        sum(rate(pg_stat_statements_total_time_seconds_count[5m]))
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # TIER 3 — INFRASTRUCTURE
+  # The platform layer. Breach these and everything above is at risk.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  - name: node-availability
+    tier: 3
+    service: eks-nodes
+    description: >
+      99.99% of EKS nodes are healthy and schedulable at any point in time.
+    slo: 99.99
+    sli:
+      type: availability
+      good_events: |
+        sum(kube_node_status_condition{condition="Ready",status="true"})
+      total_events: |
+        count(kube_node_info)
+
+  - name: pod-restart-rate
+    tier: 3
+    service: all-pods
+    description: >
+      Total pod restarts across the cluster stays below 1 per hour.
+      High restart rates signal instability or misconfiguration.
+    slo: 99.9
+    sli:
+      type: availability
+      good_events: |
+        (sum(increase(kube_pod_container_status_restarts_total[1h])) < 1)
+      total_events: "1"
+
+  - name: deployment-success-rate
+    tier: 3
+    service: deployments
+    description: >
+      99.5% of deployments complete successfully without manual rollback.
+    slo: 99.5
+    sli:
+      type: availability
+      good_events: |
+        sum(deployment_success_total)
+      total_events: |
+        sum(deployment_attempts_total)
+
+# ── Error Budget Policy ───────────────────────────────────────────────────────
+# What we do when error budget is consumed — agreed upon by the team.
+
+error_budget_policy:
+
+  at_50_percent_consumed:
+    - Review recent changes for correlation with error budget burn
+    - Ensure all alerts are firing correctly
+    - No action required unless burn rate is accelerating
+
+  at_75_percent_consumed:
+    - Freeze all non-critical deployments to the affected service
+    - Engineering lead notified
+    - Daily review of error budget trend
+
+  at_100_percent_consumed:
+    - Full deployment freeze on affected service
+    - Incident opened automatically
+    - All engineering effort redirected to reliability
+    - No new features until budget is restored
+    - Postmortem required before freeze is lifted

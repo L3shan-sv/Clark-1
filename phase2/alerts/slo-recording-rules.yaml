@@ -1,0 +1,161 @@
+# alerts/slo-recording-rules.yaml
+# Recording rules pre-compute SLI ratios so alert evaluation is fast.
+# Without these, multi-window burn rate alerts would be extremely expensive.
+# Rule of thumb: if a PromQL expression is used in 3+ places, make it a recording rule.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: slo-recording-rules
+  namespace: observability
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+
+    # ── Order Service SLIs ──────────────────────────────────────────────────
+
+    - name: slo.order-service.availability
+      interval: 30s
+      rules:
+
+        # 5-minute rolling availability ratio
+        - record: slo:order_service_availability:ratio_rate5m
+          expr: |
+            sum(rate(order_service_requests_total{status_code!~"5.."}[5m]))
+            /
+            sum(rate(order_service_requests_total[5m]))
+
+        # Multi-window ratios used by burn rate alerts
+        - record: slo:order_service_availability:ratio_rate30m
+          expr: |
+            sum(rate(order_service_requests_total{status_code!~"5.."}[30m]))
+            /
+            sum(rate(order_service_requests_total[30m]))
+
+        - record: slo:order_service_availability:ratio_rate1h
+          expr: |
+            sum(rate(order_service_requests_total{status_code!~"5.."}[1h]))
+            /
+            sum(rate(order_service_requests_total[1h]))
+
+        - record: slo:order_service_availability:ratio_rate6h
+          expr: |
+            sum(rate(order_service_requests_total{status_code!~"5.."}[6h]))
+            /
+            sum(rate(order_service_requests_total[6h]))
+
+        - record: slo:order_service_availability:ratio_rate1d
+          expr: |
+            sum(rate(order_service_requests_total{status_code!~"5.."}[1d]))
+            /
+            sum(rate(order_service_requests_total[1d]))
+
+        - record: slo:order_service_availability:ratio_rate3d
+          expr: |
+            sum(rate(order_service_requests_total{status_code!~"5.."}[3d]))
+            /
+            sum(rate(order_service_requests_total[3d]))
+
+        # Error budget remaining (1 = full, 0 = exhausted)
+        # SLO is 99.9% → target = 0.999
+        - record: slo:order_service_availability:error_budget_remaining
+          expr: |
+            (slo:order_service_availability:ratio_rate1d - 0.999) / (1 - 0.999)
+
+    - name: slo.order-service.latency
+      interval: 30s
+      rules:
+
+        - record: slo:order_service_latency_200ms:ratio_rate5m
+          expr: |
+            sum(rate(order_service_request_duration_seconds_bucket{le="0.2",method="POST",endpoint="/orders"}[5m]))
+            /
+            sum(rate(order_service_request_duration_seconds_count{method="POST",endpoint="/orders"}[5m]))
+
+        - record: slo:order_service_latency_200ms:ratio_rate30m
+          expr: |
+            sum(rate(order_service_request_duration_seconds_bucket{le="0.2",method="POST",endpoint="/orders"}[30m]))
+            /
+            sum(rate(order_service_request_duration_seconds_count{method="POST",endpoint="/orders"}[30m]))
+
+        - record: slo:order_service_latency_200ms:ratio_rate1h
+          expr: |
+            sum(rate(order_service_request_duration_seconds_bucket{le="0.2",method="POST",endpoint="/orders"}[1h]))
+            /
+            sum(rate(order_service_request_duration_seconds_count{method="POST",endpoint="/orders"}[1h]))
+
+        - record: slo:order_service_latency_200ms:ratio_rate6h
+          expr: |
+            sum(rate(order_service_request_duration_seconds_bucket{le="0.2",method="POST",endpoint="/orders"}[6h]))
+            /
+            sum(rate(order_service_request_duration_seconds_count{method="POST",endpoint="/orders"}[6h]))
+
+        - record: slo:order_service_latency_200ms:ratio_rate3d
+          expr: |
+            sum(rate(order_service_request_duration_seconds_bucket{le="0.2",method="POST",endpoint="/orders"}[3d]))
+            /
+            sum(rate(order_service_request_duration_seconds_count{method="POST",endpoint="/orders"}[3d]))
+
+    # ── Payment Service SLIs ────────────────────────────────────────────────
+
+    - name: slo.payment-service.availability
+      interval: 30s
+      rules:
+
+        - record: slo:payment_service_availability:ratio_rate5m
+          expr: |
+            sum(rate(payment_service_requests_total{status_code!~"5.."}[5m]))
+            /
+            sum(rate(payment_service_requests_total[5m]))
+
+        - record: slo:payment_service_availability:ratio_rate30m
+          expr: |
+            sum(rate(payment_service_requests_total{status_code!~"5.."}[30m]))
+            /
+            sum(rate(payment_service_requests_total[30m]))
+
+        - record: slo:payment_service_availability:ratio_rate1h
+          expr: |
+            sum(rate(payment_service_requests_total{status_code!~"5.."}[1h]))
+            /
+            sum(rate(payment_service_requests_total[1h]))
+
+        - record: slo:payment_service_availability:ratio_rate6h
+          expr: |
+            sum(rate(payment_service_requests_total{status_code!~"5.."}[6h]))
+            /
+            sum(rate(payment_service_requests_total[6h]))
+
+        - record: slo:payment_service_availability:ratio_rate3d
+          expr: |
+            sum(rate(payment_service_requests_total{status_code!~"5.."}[3d]))
+            /
+            sum(rate(payment_service_requests_total[3d]))
+
+        # Payment SLO is 99.95% — tighter than order service
+        - record: slo:payment_service_availability:error_budget_remaining
+          expr: |
+            (slo:payment_service_availability:ratio_rate1d - 0.9995) / (1 - 0.9995)
+
+    # ── Infrastructure SLIs ─────────────────────────────────────────────────
+
+    - name: slo.infrastructure
+      interval: 60s
+      rules:
+
+        - record: slo:node_availability:ratio_rate5m
+          expr: |
+            sum(kube_node_status_condition{condition="Ready",status="true"})
+            /
+            count(kube_node_info)
+
+        - record: slo:pod_restart_rate:rate1h
+          expr: |
+            sum(increase(kube_pod_container_status_restarts_total{namespace="app"}[1h]))
+
+        # Kafka consumer lag across all consumer groups
+        - record: slo:kafka_consumer_lag:max
+          expr: |
+            max(kafka_consumergroup_lag) by (consumergroup, topic)
