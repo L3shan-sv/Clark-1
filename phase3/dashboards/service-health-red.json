@@ -1,0 +1,188 @@
+{
+  "uid": "service-health-red",
+  "title": "Service Health — RED Method",
+  "description": "Rate, Errors, Duration per service. The first dashboard to open during an incident.",
+  "tags": ["red", "service", "incidents"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "type": "query",
+        "query": "label_values(order_service_requests_total, service)",
+        "label": "Service",
+        "multi": false,
+        "options": [
+          { "text": "order-service", "value": "order-service" },
+          { "text": "payment-service", "value": "payment-service" },
+          { "text": "notification-service", "value": "notification-service" },
+          { "text": "analytics-service", "value": "analytics-service" }
+        ]
+      }
+    ]
+  },
+  "panels": [
+
+    {
+      "id": 1,
+      "title": "R — Request Rate (req/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 8, "h": 6 },
+      "description": "Requests per second. A drop here means traffic is being lost.",
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "color": { "mode": "palette-classic" } }
+      },
+      "targets": [
+        {
+          "expr": "sum by (endpoint) (rate(order_service_requests_total[1m]))",
+          "legendFormat": "{{ endpoint }}"
+        }
+      ]
+    },
+
+    {
+      "id": 2,
+      "title": "E — Error Rate (%)",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 0, "w": 8, "h": 6 },
+      "description": "Percentage of requests returning 5xx. SLO threshold is 0.1%.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.001 },
+              { "color": "red", "value": 0.005 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line+area" } }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(order_service_requests_total{status_code=~\"5..\"}[1m])) / sum(rate(order_service_requests_total[1m]))",
+          "legendFormat": "Error Rate"
+        }
+      ]
+    },
+
+    {
+      "id": 3,
+      "title": "D — Duration (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 0, "w": 8, "h": 6 },
+      "description": "Latency percentiles. SLO is 95% of requests under 200ms.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(order_service_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(order_service_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(order_service_request_duration_seconds_bucket[1m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+
+    {
+      "id": 4,
+      "title": "Active Requests (In-Flight)",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 6, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "sum(order_service_active_requests)",
+        "legendFormat": "In-Flight"
+      }]
+    },
+
+    {
+      "id": 5,
+      "title": "Orders Created (last 5m)",
+      "type": "stat",
+      "gridPos": { "x": 4, "y": 6, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "color": { "fixedColor": "green", "mode": "fixed" } }
+      },
+      "targets": [{
+        "expr": "sum(increase(orders_created_total[5m]))",
+        "legendFormat": "Orders"
+      }]
+    },
+
+    {
+      "id": 6,
+      "title": "Payment Latency p95",
+      "type": "stat",
+      "gridPos": { "x": 8, "y": 6, "w": 4, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.3 },
+              { "color": "red", "value": 0.5 }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum by (le) (rate(order_payment_call_duration_seconds_bucket[5m])))",
+        "legendFormat": "Payment p95"
+      }]
+    },
+
+    {
+      "id": 7,
+      "title": "Error Rate by Endpoint",
+      "type": "table",
+      "gridPos": { "x": 0, "y": 10, "w": 12, "h": 6 },
+      "description": "Which endpoints are erroring. Start here during an incident.",
+      "targets": [{
+        "expr": "sum by (endpoint, status_code) (rate(order_service_requests_total{status_code=~\"5..\"}[5m]))",
+        "legendFormat": "{{ endpoint }} → {{ status_code }}",
+        "instant": true
+      }]
+    },
+
+    {
+      "id": 8,
+      "title": "Kafka Consumer Lag",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 10, "w": 12, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1000 },
+              { "color": "red", "value": 10000 }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "expr": "kafka_consumergroup_lag",
+        "legendFormat": "{{ consumergroup }} / {{ topic }}"
+      }]
+    }
+
+  ]
+}
