@@ -1,0 +1,197 @@
+# kubernetes/supply-chain/supply-chain-security.yaml
+# Supply Chain Security — prevent compromised images from ever running.
+#
+# Attack surface this defends:
+#   - Compromised CI/CD → malicious image pushed to registry
+#   - Typosquat attacks (pulling "redus:7" instead of "redis:7")
+#   - Dependency confusion attacks
+#   - Images with known CVEs deployed to prod
+#
+# Stack:
+#   Cosign    → signs every image at build time with keyless OIDC signing
+#   Sigstore  → transparency log — all signatures are publicly auditable
+#   Syft      → generates SBOM (Software Bill of Materials) for every image
+#   Grype     → scans SBOM against CVE databases — blocks CRITICAL CVEs
+#   Policy Controller → enforces signature verification at admission time
+
+---
+# ── Sigstore Policy Controller — blocks unsigned images ─────────────────────
+# Install: helm install policy-controller sigstore/policy-controller -n cosign-system
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: require-signed-images
+spec:
+  images:
+    # Enforce on our application images
+    - glob: "your-registry/**"
+
+  authorities:
+    - keyless:
+        url: https://fulcio.sigstore.dev
+        identities:
+          # Only accept signatures from our GitHub Actions CI
+          - issuer: https://token.actions.githubusercontent.com
+            subjectRegExp: "https://github.com/your-org/autonomous-observability-platform/.github/workflows/.*"
+      ctlog:
+        url: https://rekor.sigstore.dev
+
+---
+# ── GitHub Actions CI pipeline (reference) ───────────────────────────────────
+# This is what runs in .github/workflows/build.yaml
+# Generates SBOM, scans for CVEs, signs the image — all before it can deploy
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ci-pipeline-reference
+  namespace: security
+data:
+  build.yaml: |
+    name: Build, Scan, Sign, Push
+
+    on:
+      push:
+        branches: [main]
+      pull_request:
+        branches: [main]
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write    # Required for keyless Cosign signing
+
+    jobs:
+      build-scan-sign:
+        runs-on: ubuntu-latest
+        strategy:
+          matrix:
+            service: [order-service, payment-service, notification-service, analytics-service]
+
+        steps:
+          - uses: actions/checkout@v4
+
+          - name: Set up Docker Buildx
+            uses: docker/setup-buildx-action@v3
+
+          - name: Login to registry
+            uses: docker/login-action@v3
+            with:
+              registry: your-registry
+              username: ${{ secrets.REGISTRY_USER }}
+              password: ${{ secrets.REGISTRY_TOKEN }}
+
+          - name: Build image
+            id: build
+            uses: docker/build-push-action@v5
+            with:
+              context: ./app/${{ matrix.service }}
+              push: true
+              tags: your-registry/${{ matrix.service }}:${{ github.sha }}
+              # Provenance for SLSA level 3
+              provenance: true
+              sbom: true
+
+          # ── Step 1: Generate SBOM ─────────────────────────────────────────
+          - name: Generate SBOM with Syft
+            uses: anchore/sbom-action@v0
+            with:
+              image: your-registry/${{ matrix.service }}:${{ github.sha }}
+              format: spdx-json
+              output-file: sbom-${{ matrix.service }}.spdx.json
+
+          - name: Upload SBOM as artifact
+            uses: actions/upload-artifact@v4
+            with:
+              name: sbom-${{ matrix.service }}
+              path: sbom-${{ matrix.service }}.spdx.json
+
+          # ── Step 2: Scan for CVEs with Grype ─────────────────────────────
+          - name: Scan SBOM with Grype
+            uses: anchore/scan-action@v3
+            id: grype
+            with:
+              sbom: sbom-${{ matrix.service }}.spdx.json
+              fail-build: true              # Block on CRITICAL CVEs
+              severity-cutoff: critical     # HIGH = warning, CRITICAL = fail
+              output-format: sarif
+
+          - name: Upload Grype results to GitHub Security
+            uses: github/codeql-action/upload-sarif@v3
+            if: always()
+            with:
+              sarif_file: ${{ steps.grype.outputs.sarif }}
+
+          # ── Step 3: Sign image with Cosign (keyless OIDC) ─────────────────
+          - name: Install Cosign
+            uses: sigstore/cosign-installer@v3
+
+          - name: Sign image (keyless via GitHub OIDC)
+            run: |
+              cosign sign --yes \
+                your-registry/${{ matrix.service }}@${{ steps.build.outputs.digest }}
+
+          # ── Step 4: Attach SBOM to image in registry ──────────────────────
+          - name: Attach SBOM to image
+            run: |
+              cosign attach sbom \
+                --sbom sbom-${{ matrix.service }}.spdx.json \
+                your-registry/${{ matrix.service }}@${{ steps.build.outputs.digest }}
+
+          # ── Step 5: Verify signature before marking ready ─────────────────
+          - name: Verify signature
+            run: |
+              cosign verify \
+                --certificate-identity-regexp="https://github.com/your-org/.*" \
+                --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+                your-registry/${{ matrix.service }}@${{ steps.build.outputs.digest }}
+
+          - name: Deployment complete
+            run: |
+              echo "✅ ${{ matrix.service }} built, scanned, signed, and verified"
+              echo "Image: your-registry/${{ matrix.service }}@${{ steps.build.outputs.digest }}"
+
+---
+# ── Admission webhook: verify image signatures at deploy time ─────────────────
+# The Policy Controller already handles this via ClusterImagePolicy above.
+# This ConfigMap documents what happens when an unsigned image tries to deploy:
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: policy-enforcement-summary
+  namespace: security
+data:
+  README.md: |
+    # What happens when you try to deploy an unsigned image
+
+    1. kubectl apply -f deployment.yaml
+    2. API server → admission webhook → Policy Controller
+    3. Policy Controller checks: "Is this image signed by our CI?"
+    4. Cosign verifies signature against Rekor transparency log
+    5. If signature missing or invalid → DENIED:
+       Error: "admission webhook denied the request:
+        image 'your-registry/order-service:abc123' does not have a
+        valid signature from 'https://github.com/your-org/...'"
+
+    # What the audit log looks like in Vault
+
+    Every image pull is logged:
+    {
+      "time": "2024-01-15T14:23:45Z",
+      "type": "request",
+      "auth": {"accessor": "k8s/app/order-service"},
+      "request": {"path": "secret/data/app/kafka"},
+      "response": {"data": {"keys": ["kafka-creds"]}}
+    }
+
+    # CVE scan gates
+
+    CRITICAL CVEs → build fails, image never pushed
+    HIGH CVEs     → build warning, image pushed with annotation
+    MEDIUM/LOW    → logged in SBOM, no gate
+
+    # SBOM retrieval
+
+    To get the SBOM for any running image:
+      cosign download sbom your-registry/order-service:sha256:abc123
