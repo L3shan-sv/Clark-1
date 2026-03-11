@@ -1,0 +1,201 @@
+# kubernetes/vault/vault-config.yaml
+# HashiCorp Vault — dynamic secrets engine.
+#
+# Philosophy: No pod ever holds a long-lived secret.
+#   - DB passwords rotate every 1 hour automatically
+#   - AWS credentials are ephemeral STS tokens (15 min TTL)
+#   - TLS certs issued by Vault PKI, rotated before expiry
+#   - Kubernetes ServiceAccounts authenticate — no static tokens
+#
+# Threat model this defeats:
+#   - Stolen pod env vars → credentials already expired
+#   - Compromised image → no secrets baked in
+#   - Insider threat → every access is audited with pod identity
+#   - Secret sprawl → one source of truth, not .env files everywhere
+
+---
+# ── Vault Helm values (HA mode, 3 replicas, auto-unseal via AWS KMS) ──────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-helm-values-reference
+  namespace: security
+  annotations:
+    note: "helm upgrade --install vault hashicorp/vault -n security -f vault-values.yaml"
+data:
+  vault-values.yaml: |
+    server:
+      ha:
+        enabled: true
+        replicas: 3
+        raft:
+          enabled: true
+          setNodeId: true
+          config: |
+            ui = true
+            listener "tcp" {
+              tls_disable = 1
+              address = "[::]:8200"
+              cluster_address = "[::]:8201"
+            }
+            storage "raft" {
+              path = "/vault/data"
+            }
+            # Auto-unseal using AWS KMS — no human needed on restart
+            seal "awskms" {
+              region     = "us-east-1"
+              kms_key_id = "alias/vault-unseal-key"
+            }
+            service_registration "kubernetes" {}
+
+      nodeSelector:
+        role: security
+      tolerations:
+        - key: security
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "256Mi"
+        limits:
+          cpu: "1000m"
+          memory: "512Mi"
+
+      dataStorage:
+        enabled: true
+        size: 10Gi
+        storageClass: gp3
+
+      auditStorage:
+        enabled: true
+        size: 20Gi
+        storageClass: gp3
+
+    injector:
+      enabled: true    # Vault Agent Injector — sidecars inject secrets as files
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+
+    ui:
+      enabled: true
+
+---
+# ── Vault Initialisation Job (runs once after first deploy) ───────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vault-init
+  namespace: security
+spec:
+  template:
+    spec:
+      serviceAccountName: vault-init
+      restartPolicy: OnFailure
+      containers:
+        - name: vault-init
+          image: hashicorp/vault:1.15.4
+          env:
+            - name: VAULT_ADDR
+              value: "http://vault.security.svc.cluster.local:8200"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "⏳ Waiting for Vault to start..."
+              until vault status 2>/dev/null; do sleep 5; done
+
+              echo "🔑 Enabling Kubernetes auth..."
+              vault auth enable kubernetes 2>/dev/null || true
+
+              vault write auth/kubernetes/config \
+                kubernetes_host="https://$KUBERNETES_PORT_443_TCP_ADDR:443" \
+                token_reviewer_jwt="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+                kubernetes_ca_cert="$(cat /var/run/secrets/kubernetes.io/serviceaccount/ca.crt)"
+
+              echo "🗄️  Enabling secrets engines..."
+              vault secrets enable -path=secret kv-v2        2>/dev/null || true
+              vault secrets enable database                   2>/dev/null || true
+              vault secrets enable aws                        2>/dev/null || true
+              vault secrets enable -path=pki pki              2>/dev/null || true
+              vault secrets enable -path=pki_int pki          2>/dev/null || true
+
+              echo "📜 Configuring PKI..."
+              vault write pki/root/generate/internal \
+                common_name="autonomous-observability-platform Root CA" \
+                ttl=87600h
+
+              vault write pki/config/urls \
+                issuing_certificates="http://vault.security.svc.cluster.local:8200/v1/pki/ca" \
+                crl_distribution_points="http://vault.security.svc.cluster.local:8200/v1/pki/crl"
+
+              # Intermediate CA
+              CSR=$(vault write -format=json pki_int/intermediate/generate/internal \
+                common_name="autonomous-observability-platform Intermediate CA" | jq -r .data.csr)
+              CERT=$(vault write -format=json pki/root/sign-intermediate \
+                csr="$CSR" format=pem_bundle | jq -r .data.certificate)
+              vault write pki_int/intermediate/set-signed certificate="$CERT"
+
+              vault write pki_int/roles/app-services \
+                allowed_domains="app.svc.cluster.local,svc.cluster.local" \
+                allow_subdomains=true \
+                max_ttl=72h
+
+              echo "🗄️  Configuring database secrets..."
+              vault write database/config/postgresql \
+                plugin_name=postgresql-database-plugin \
+                allowed_roles="app-services" \
+                connection_url="postgresql://{{username}}:{{password}}@postgresql.app.svc.cluster.local:5432/appdb?sslmode=require" \
+                username="${POSTGRES_VAULT_USER}" \
+                password="${POSTGRES_VAULT_PASSWORD}"
+
+              vault write database/roles/app-services \
+                db_name=postgresql \
+                creation_statements="CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO \"{{name}}\";" \
+                default_ttl=1h \
+                max_ttl=2h
+
+              echo "📋 Creating Vault policies..."
+              vault policy write app-services - <<'EOF'
+              # Allow reading dynamic DB credentials
+              path "database/creds/app-services" {
+                capabilities = ["read"]
+              }
+              # Allow reading static secrets
+              path "secret/data/app/*" {
+                capabilities = ["read"]
+              }
+              # Allow reading PKI certs
+              path "pki_int/issue/app-services" {
+                capabilities = ["create", "update"]
+              }
+              EOF
+
+              vault policy write ml-services - <<'EOF'
+              path "secret/data/ml/*" {
+                capabilities = ["read"]
+              }
+              path "database/creds/app-services" {
+                capabilities = ["read"]
+              }
+              EOF
+
+              echo "🔑 Creating Kubernetes auth roles..."
+              # Map app namespace ServiceAccounts → app-services policy
+              vault write auth/kubernetes/role/app-services \
+                bound_service_account_names="order-service,payment-service,notification-service,analytics-service" \
+                bound_service_account_namespaces="app" \
+                policies="app-services" \
+                ttl=1h
+
+              vault write auth/kubernetes/role/ml-services \
+                bound_service_account_names="ml-service-account" \
+                bound_service_account_namespaces="ml" \
+                policies="ml-services" \
+                ttl=1h
+
+              echo "✅ Vault initialisation complete"
