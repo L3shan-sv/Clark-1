@@ -1,0 +1,84 @@
+# kubernetes/rightsizing/rightsizing-deployment.yaml
+#
+# Deploys the rightsizing engine as a weekly-running pod in the ml namespace.
+# Reads 30 days of Prometheus data, generates recommendations, posts to Slack.
+# Writes a kubectl patch script to /tmp that engineers apply after review.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rightsizing-engine
+  namespace: ml
+  labels:
+    app: rightsizing-engine
+    team: platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rightsizing-engine
+  template:
+    metadata:
+      labels:
+        app: rightsizing-engine
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8004"
+    spec:
+      serviceAccountName: ml-service-account
+      containers:
+        - name: rightsizing-engine
+          image: your-registry/rightsizing-engine:latest
+          ports:
+            - containerPort: 8004   # Prometheus metrics
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: slack-webhook-secret
+                  key: webhook-url
+            - name: AUTO_APPLY
+              value: "false"     # Always false — humans review patches before applying
+            - name: SAFETY_MARGIN
+              value: "0.25"      # 25% headroom above p95
+            - name: MAX_DECREASE_PCT
+              value: "0.50"      # Never recommend cutting > 50% in one step
+            - name: ANALYSIS_DAYS
+              value: "30"
+            - name: CPU_PRICE_PER_CORE_HOUR
+              value: "0.0464"    # m5.xlarge pricing — update for your instance mix
+            - name: MEM_PRICE_PER_GB_HOUR
+              value: "0.0058"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"    # Needs memory for 30 days of data
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 8004
+            initialDelaySeconds: 30
+            periodSeconds: 60
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: false   # Needs to write /tmp patch script
+            allowPrivilegeEscalation: false
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rightsizing-engine
+  namespace: ml
+spec:
+  selector:
+    app: rightsizing-engine
+  ports:
+    - port: 8004
+      targetPort: 8004
