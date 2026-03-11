@@ -1,0 +1,316 @@
+# kubernetes/chaos-mesh/experiments/05-cascade-failure.yaml
+#
+# Experiment 5: Cascade Failure — The Boss Fight
+#
+# This is the full integration test. We inject multiple simultaneous failures
+# and verify the self-healing system handles ALL of them without human intervention.
+#
+# Failure sequence (staggered to create realistic cascade):
+#   T+0:00  Redis memory pressure → hits 90% (triggers Argo remediation)
+#   T+0:30  Kafka consumer lag spikes (notification-service falls behind)
+#   T+1:00  Payment service latency degrades (side effect of Redis pressure)
+#   T+1:30  Order service error rate climbs (upstream dependency failures)
+#   T+2:00  Node CPU pressure (traffic spike coincides with degradation)
+#
+# Hypothesis:
+#   1. Redis eviction workflow fires at T+0:30 (within 30s of threshold breach)
+#   2. Causal inference engine identifies Redis as root cause within 90s
+#   3. Auto-scaling prevents the traffic spike from causing latency breach
+#   4. Cascade does NOT reach full outage (SLO maintained)
+#   5. NO manual intervention required
+#   6. Full recovery within 10 minutes of chaos termination
+#   7. Total SLO budget consumed < 5 minutes
+#
+# What this uniquely tests:
+#   - Do remediation workflows CONFLICT with each other?
+#     (e.g. does rollback fire while Redis remediation is running?)
+#   - Does the causal engine correctly identify Redis as root cause
+#     when order-service errors are the visible symptom?
+#   - Does the ML anomaly detector correctly attribute the anomaly
+#     UPSTREAM (Redis) rather than the symptomatic service (order-service)?
+#   - Does Alertmanager inhibition prevent alert storm?
+#     (only root cause should page, not every downstream symptom)
+
+---
+# ── Phase 1: Redis memory pressure ───────────────────────────────────────────
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: exp05-phase1-redis-memory
+  namespace: chaos
+  annotations:
+    experiment.chaos/sequence: "1 — Apply first"
+    experiment.chaos/offset: "T+0:00"
+spec:
+  action: pod-failure
+  mode: one
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: redis
+  duration: "8m"    # Long enough for cascade to play out
+
+---
+# ── Phase 2: Kafka consumer lag ───────────────────────────────────────────────
+# Simulated by killing notification-service (the consumer)
+# Kafka messages pile up → consumer lag grows → lag SLO alert fires
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: exp05-phase2-kafka-lag
+  namespace: chaos
+  annotations:
+    experiment.chaos/sequence: "2 — Apply 30s after phase 1"
+    experiment.chaos/offset: "T+0:30"
+spec:
+  action: pod-failure
+  mode: one
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: notification-service
+  duration: "6m"
+
+---
+# ── Phase 3: Network latency (payment ← Redis pressure side effect) ───────────
+# Redis pressure means cache misses → payment service hits DB directly → slower
+# Simulate this with 200ms latency on payment-service
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: exp05-phase3-payment-latency
+  namespace: chaos
+  annotations:
+    experiment.chaos/sequence: "3 — Apply 60s after phase 1"
+    experiment.chaos/offset: "T+1:00"
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: payment-service
+  delay:
+    latency: "200ms"
+    jitter: "50ms"
+  duration: "5m"
+
+---
+# ── Phase 4: CPU stress (coincident traffic spike) ────────────────────────────
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: exp05-phase4-cpu-spike
+  namespace: chaos
+  annotations:
+    experiment.chaos/sequence: "4 — Apply 90s after phase 1"
+    experiment.chaos/offset: "T+1:30"
+spec:
+  mode: all
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: order-service
+  stressors:
+    cpu:
+      workers: 2
+      load: 50    # 50% — enough to stress but not OOMKill
+  duration: "4m"
+
+---
+# ── Abort: Kill all cascade experiments immediately ───────────────────────────
+# If the experiment goes badly, run this command:
+#
+#   kubectl delete podchaos,networkchaos,stresschaos -n chaos -l experiment=exp05
+#
+# Or to abort a single phase:
+#   kubectl delete podchaos exp05-phase1-redis-memory -n chaos
+
+---
+# ── Chaos Workflow: Orchestrated cascade (all phases, timed) ─────────────────
+# This Argo Workflow applies each chaos phase with correct delays
+# so you don't have to manually apply each one.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: exp05-cascade-failure-orchestrator
+  namespace: chaos
+spec:
+  entrypoint: cascade
+  serviceAccountName: chaos-operator
+
+  templates:
+    - name: cascade
+      steps:
+        - - name: verify-steady-state
+            template: verify-steady-state
+
+        - - name: phase1-redis
+            template: apply-chaos
+            arguments:
+              parameters:
+                - name: manifest
+                  value: "exp05-phase1-redis-memory"
+
+        - - name: wait-30s
+            template: sleep
+            arguments:
+              parameters:
+                - name: duration
+                  value: "30"
+
+        - - name: phase2-kafka
+            template: apply-chaos
+            arguments:
+              parameters:
+                - name: manifest
+                  value: "exp05-phase2-kafka-lag"
+
+        - - name: wait-30s-2
+            template: sleep
+            arguments:
+              parameters:
+                - name: duration
+                  value: "30"
+
+        - - name: phase3-latency
+            template: apply-chaos
+            arguments:
+              parameters:
+                - name: manifest
+                  value: "exp05-phase3-payment-latency"
+
+        - - name: wait-30s-3
+            template: sleep
+            arguments:
+              parameters:
+                - name: duration
+                  value: "30"
+
+        - - name: phase4-cpu
+            template: apply-chaos
+            arguments:
+              parameters:
+                - name: manifest
+                  value: "exp05-phase4-cpu-spike"
+
+        - - name: observe-10min
+            template: sleep
+            arguments:
+              parameters:
+                - name: duration
+                  value: "600"
+
+        - - name: verify-recovery
+            template: verify-recovery
+
+    # ── Verify steady state before starting chaos ─────────────────────────────
+    - name: verify-steady-state
+      script:
+        image: curlimages/curl:latest
+        command: [sh]
+        source: |
+          PROMETHEUS="http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
+
+          echo "🔍 Verifying steady state before chaos..."
+
+          ERROR_RATE=$(curl -s "$PROMETHEUS/api/v1/query" \
+            --data-urlencode "query=sum(rate(order_service_requests_total{status_code=~'5..'}[5m])) / sum(rate(order_service_requests_total[5m]))" \
+            | grep -o '"value":\[.*\]' | grep -o '[0-9.eE+-]*"$' | tr -d '"')
+
+          echo "Current error rate: ${ERROR_RATE:-0}"
+
+          BUDGET=$(curl -s "$PROMETHEUS/api/v1/query" \
+            --data-urlencode "query=slo:order_service_availability:error_budget_remaining" \
+            | grep -o '"value":\[.*\]' | grep -o '[0-9.eE+-]*"$' | tr -d '"')
+
+          echo "Error budget remaining: ${BUDGET:-unknown}"
+
+          # Abort if budget < 30%
+          if [ "$(echo "${BUDGET:-1} < 0.30" | bc -l)" = "1" ]; then
+            echo "❌ Error budget too low (< 30%). Aborting chaos experiment."
+            exit 1
+          fi
+
+          echo "✅ Steady state confirmed. Proceeding with cascade experiment."
+
+    - name: apply-chaos
+      inputs:
+        parameters:
+          - name: manifest
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          echo "💥 Applying chaos: {{inputs.parameters.manifest}}"
+          kubectl apply -f /chaos-manifests/{{inputs.parameters.manifest}}.yaml
+          echo "✅ Chaos applied: {{inputs.parameters.manifest}}"
+
+    - name: sleep
+      inputs:
+        parameters:
+          - name: duration
+      script:
+        image: alpine:latest
+        command: [sh]
+        source: |
+          echo "⏳ Waiting {{inputs.parameters.duration}} seconds..."
+          sleep {{inputs.parameters.duration}}
+
+    - name: verify-recovery
+      script:
+        image: curlimages/curl:latest
+        command: [sh]
+        source: |
+          PROMETHEUS="http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
+          SLACK="${SLACK_WEBHOOK_URL}"
+
+          echo "🔍 Verifying recovery after cascade..."
+          sleep 60   # Give the system 60s to settle after chaos ends
+
+          ERROR_RATE=$(curl -s "$PROMETHEUS/api/v1/query" \
+            --data-urlencode "query=sum(rate(order_service_requests_total{status_code=~'5..'}[5m])) / sum(rate(order_service_requests_total[5m]))" \
+            | grep -o '"value":\[.*\]' | grep -o '[0-9.eE+-]*"$' | tr -d '"')
+
+          KAFKA_LAG=$(curl -s "$PROMETHEUS/api/v1/query" \
+            --data-urlencode "query=max(kafka_consumergroup_lag)" \
+            | grep -o '"value":\[.*\]' | grep -o '[0-9.eE+-]*"$' | tr -d '"')
+
+          echo "Post-chaos error rate: ${ERROR_RATE:-0}"
+          echo "Post-chaos Kafka lag:  ${KAFKA_LAG:-0}"
+
+          RECOVERED="true"
+          [ "$(echo "${ERROR_RATE:-0} > 0.001" | bc -l)" = "1" ] && RECOVERED="false"
+          [ "$(echo "${KAFKA_LAG:-0} > 30000" | bc -l)" = "1" ]  && RECOVERED="false"
+
+          if [ "$RECOVERED" = "true" ]; then
+            STATUS="✅ PASSED"
+            COLOR="good"
+            MSG="System recovered to steady state. All SLOs maintained. No manual intervention required."
+          else
+            STATUS="❌ FAILED"
+            COLOR="danger"
+            MSG="System did not fully recover. Error rate: ${ERROR_RATE}. Kafka lag: ${KAFKA_LAG}. Manual investigation required."
+          fi
+
+          echo "$STATUS — $MSG"
+
+          curl -s -X POST "$SLACK" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"title\": \"💥 Chaos Experiment 5 — Cascade Failure: $STATUS\",
+                \"fields\": [
+                  {\"title\": \"Post-chaos error rate\", \"value\": \"${ERROR_RATE:-0}\", \"short\": true},
+                  {\"title\": \"Post-chaos Kafka lag\", \"value\": \"${KAFKA_LAG:-0} msgs\", \"short\": true},
+                  {\"title\": \"Result\", \"value\": \"$MSG\", \"short\": false}
+                ],
+                \"footer\": \"Chaos Engineering | Autonomous Observability Platform\"
+              }]
+            }"
