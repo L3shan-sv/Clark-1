@@ -1,0 +1,108 @@
+# kubernetes/chaos-mesh/experiments/02-network-partition.yaml
+#
+# Experiment 2: Network Partition — Order → Payment
+#
+# Hypothesis:
+#   When order-service cannot reach payment-service for 3 minutes:
+#     1. order-service starts returning 503s on POST /orders within 10s
+#     2. Error rate SLO alert fires within 2 minutes (burn rate > 14.4×)
+#     3. Argo auto-rollback does NOT trigger (not a deployment regression)
+#     4. Causal inference engine correctly identifies payment-service
+#        as the upstream cause within 90 seconds of anomaly detection
+#     5. On-call is paged with correct runbook link
+#     6. When partition heals, error rate returns to 0 within 30s
+#
+# What this tests:
+#   - Istio circuit breaker configuration (outlierDetection in DestinationRule)
+#   - Timeout configuration in order-service HTTP client (httpx)
+#   - Alertmanager routing (error rate → correct receiver)
+#   - Causal inference dependency graph accuracy
+#   - Alert inhibition (don't page for symptoms when root cause is paged)
+
+---
+# ── 2a: Latency injection (before full partition) ─────────────────────────────
+# Start with latency, not full partition. Realistic — network problems
+# usually manifest as slowness before complete failure.
+# Tests: latency SLO alert, LSTM anomaly detector (temporal pattern shift)
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: exp02a-payment-latency
+  namespace: chaos
+  annotations:
+    experiment.chaos/step: "2a — 500ms latency on payment-service ingress"
+    experiment.chaos/hypothesis: "Latency SLO alert fires within 3 minutes. p95 latency > 500ms detected."
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: payment-service
+  delay:
+    latency: "500ms"
+    correlation: "50"    # 50% jitter — realistic network degradation
+    jitter: "100ms"
+  direction: from        # Incoming traffic to payment-service is delayed
+  duration: "5m"
+
+---
+# ── 2b: Full network partition ────────────────────────────────────────────────
+# Run AFTER 2a — escalate from latency to full partition.
+# Tests: error rate alert, auto-remediation NOT triggering (no deployment),
+#        causal inference, alert inhibition rules.
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: exp02b-order-payment-partition
+  namespace: chaos
+  annotations:
+    experiment.chaos/step: "2b — Full network partition order → payment"
+    experiment.chaos/hypothesis: "503s within 10s. SLO critical alert within 2min. Causal engine identifies payment-service."
+    experiment.chaos/blast-radius: "All order-service pods cannot reach payment-service"
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: order-service
+  direction: to
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - app
+      labelSelectors:
+        app: payment-service
+  duration: "3m"
+
+---
+# ── 2c: Packet loss (intermittent failure) ────────────────────────────────────
+# The hardest failure to diagnose: not full partition, just lossy.
+# Tests: CUSUM drift detector (gradual error accumulation),
+#        whether anomaly detector catches < 50% packet loss
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: exp02c-packet-loss
+  namespace: chaos
+  annotations:
+    experiment.chaos/step: "2c — 30% packet loss between all app services"
+    experiment.chaos/hypothesis: "CUSUM detector catches gradual error accumulation. Ensemble confidence > 0.75 within 5 minutes."
+spec:
+  action: loss
+  mode: all
+  selector:
+    namespaces:
+      - app
+  loss:
+    loss: "30"          # 30% packet loss
+    correlation: "25"
+  direction: both
+  duration: "5m"
