@@ -1,0 +1,84 @@
+# kubernetes/argo-events/event-sources/alertmanager-webhook.yaml
+# This is the bridge between Alertmanager and Argo Events.
+# Alertmanager POSTs to this webhook whenever an alert fires.
+# Argo Events receives it, parses it, and routes to the correct sensor.
+#
+# Flow:
+#   Prometheus alert fires
+#     → Alertmanager routes to webhook receiver
+#       → Argo EventSource receives POST
+#         → Argo Sensor matches the alert
+#           → Argo Workflow triggered
+#             → Remediation executed
+#             → Slack notified
+
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: alertmanager-webhook
+  namespace: argo
+spec:
+  service:
+    ports:
+      - port: 12000
+        targetPort: 12000
+  webhook:
+
+    # ── Pod Crash Looping ─────────────────────────────────────────────────────
+    pod-crashlooping:
+      port: "12000"
+      endpoint: /pod-crashlooping
+      method: POST
+
+    # ── Deployment Error Rate Spike (triggers auto-rollback) ──────────────────
+    deployment-error-spike:
+      port: "12000"
+      endpoint: /deployment-error-spike
+      method: POST
+
+    # ── Redis Memory Pressure ─────────────────────────────────────────────────
+    redis-memory-high:
+      port: "12000"
+      endpoint: /redis-memory-high
+      method: POST
+
+    # ── Request Rate Surge (triggers predictive scaling) ─────────────────────
+    request-rate-surge:
+      port: "12000"
+      endpoint: /request-rate-surge
+      method: POST
+
+    # ── Generic anomaly — classify and create incident ────────────────────────
+    anomaly-detected:
+      port: "12000"
+      endpoint: /anomaly-detected
+      method: POST
+
+---
+# Add these receivers to your Alertmanager config (from Phase 2)
+# to route to the event source endpoints above.
+
+# In alertmanager-config.yaml, add these receivers:
+#
+# - name: argo-pod-crashlooping
+#   webhookConfigs:
+#     - url: http://alertmanager-webhook-eventsource-svc.argo.svc.cluster.local:12000/pod-crashlooping
+#       sendResolved: false
+#
+# - name: argo-deployment-error-spike
+#   webhookConfigs:
+#     - url: http://alertmanager-webhook-eventsource-svc.argo.svc.cluster.local:12000/deployment-error-spike
+#       sendResolved: false
+#
+# - name: argo-redis-memory
+#   webhookConfigs:
+#     - url: http://alertmanager-webhook-eventsource-svc.argo.svc.cluster.local:12000/redis-memory-high
+#       sendResolved: false
+#
+# And add routes:
+#   - matchers: [{name: alertname, value: PodCrashLooping}]
+#     receiver: argo-pod-crashlooping
+#   - matchers: [{name: alertname, value: DeploymentErrorSpike}]
+#     receiver: argo-deployment-error-spike
+#   - matchers: [{name: alertname, value: RedisMemoryHigh}]
+#     receiver: argo-redis-memory
