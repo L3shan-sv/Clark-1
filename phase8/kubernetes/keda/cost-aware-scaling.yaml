@@ -1,0 +1,199 @@
+# kubernetes/keda/cost-aware-scaling.yaml
+#
+# Cost-Aware Autoscaling
+#
+# Standard HPA scales on CPU/memory. That's reactive and ignorant of cost.
+# KEDA lets us scale on ANY Prometheus metric — including cost metrics.
+#
+# Cost-aware scaling adds two guardrails:
+#
+#   1. Cost ceiling ScaledObject: if namespace cost exceeds $X/hr,
+#      freeze scaling at current replica count (stop adding expensive pods)
+#
+#   2. Business-hours scaling: scale to minimum replicas at night
+#      (traffic is low, why pay for idle pods?)
+#      Prophet forecast + KEDA CronJob replaces this with intelligent scheduling.
+#
+#   3. Spot instance preference: prefer spot instances for stateless services
+#      (60-80% cheaper, tolerating spot interruption with proper preStop hooks)
+
+---
+# ── order-service: RPS + latency + cost-ceiling ───────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: order-service-cost-aware
+  namespace: app
+  annotations:
+    cost.aware/max-hourly-usd: "3.00"   # Never scale past $3/hr for this service
+spec:
+  scaleTargetRef:
+    name: order-service
+  minReplicaCount: 3
+  maxReplicaCount: 20
+  cooldownPeriod: 60
+  pollingInterval: 15
+
+  triggers:
+    # Primary: scale on request rate
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+        metricName: order_rps_per_pod
+        query: |
+          sum(rate(order_service_requests_total[1m]))
+          /
+          count(kube_pod_info{namespace="app", pod=~"order-service-.*"})
+        threshold: "50"     # Target: 50 RPS per pod
+
+    # Secondary: scale on p95 latency (catches latency-bound saturation)
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+        metricName: order_latency_p95_ms
+        query: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(order_service_request_duration_seconds_bucket[2m]))
+          ) * 1000
+        threshold: "180"    # Scale if p95 > 180ms (before SLO at 200ms)
+
+    # Cost ceiling: scale DOWN if we're spending too much
+    # (KEDA inverts — high metric value = scale up, so we invert cost ratio)
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+        metricName: order_service_cost_headroom
+        query: |
+          clamp_min(
+            3.00 - sum(container_cost_per_hour_dollars{namespace="app", pod=~"order-service.*"}),
+            0
+          )
+        threshold: "0.50"   # If headroom drops below $0.50 → stop scaling up
+
+    # Predictive: ML forecast upper bound
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+        metricName: order_forecast_replicas
+        query: |
+          ceil(ml_forecast_upper_rps{service="order-service"} / 50)
+        threshold: "1"
+
+---
+# ── Scheduled scale-down: nights and weekends ────────────────────────────────
+# Business hours: 08:00–22:00 UTC Mon-Fri (covers US business hours + EU overlap)
+# Outside this window: scale to minimum (2 pods — enough for health checks + occasional traffic)
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: order-service-business-hours-scale
+  namespace: app
+spec:
+  jobTargetRef:
+    template:
+      spec:
+        containers:
+          - name: scale
+            image: bitnami/kubectl:latest
+            command:
+              - /bin/bash
+              - -c
+              - |
+                HOUR=$(date -u +%H)
+                DOW=$(date -u +%u)  # 1=Mon, 7=Sun
+
+                # Business hours: Mon-Fri 08:00-22:00 UTC
+                if [ "$DOW" -le 5 ] && [ "$HOUR" -ge 8 ] && [ "$HOUR" -lt 22 ]; then
+                  TARGET=3
+                  echo "Business hours — scaling to minimum business replicas: $TARGET"
+                else
+                  TARGET=2
+                  echo "Off hours — scaling down to: $TARGET"
+                fi
+
+                # Only scale down — never override KEDA's scale-up decisions
+                CURRENT=$(kubectl get deployment order-service -n app \
+                  -o jsonpath='{.spec.replicas}')
+                if [ "$CURRENT" -gt "$TARGET" ]; then
+                  # Don't override if traffic is actively happening
+                  RPS=$(kubectl exec -n observability deployment/prometheus -- \
+                    wget -qO- 'localhost:9090/api/v1/query?query=sum(rate(order_service_requests_total[5m]))' \
+                    | python3 -c "import sys,json; r=json.load(sys.stdin); print(float(r['data']['result'][0]['value'][1]) if r['data']['result'] else 0)")
+                  if [ "$(echo "$RPS < 10" | bc -l)" = "1" ]; then
+                    kubectl scale deployment/order-service -n app --replicas="$TARGET"
+                    echo "Scaled to $TARGET (RPS was $RPS)"
+                  else
+                    echo "Skipping scale-down: active traffic ($RPS RPS)"
+                  fi
+                fi
+        restartPolicy: OnFailure
+
+  triggers:
+    - type: cron
+      metadata:
+        timezone: UTC
+        start: "0 22 * * 1-5"    # 22:00 Mon-Fri: scale down
+        end:   "0 8  * * 1-5"    # 08:00 Mon-Fri: allow KEDA to scale back up
+        desiredReplicas: "1"     # Trigger 1 job run
+
+---
+# ── Spot instance node group (cost savings for stateless services) ─────────────
+# Stateless services (order, notification, analytics) can tolerate spot interruption
+# if they have proper preStop hooks and PodDisruptionBudgets.
+# Payment service stays on on-demand (financial transactions must not be interrupted).
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spot-instance-guidance
+  namespace: cost
+data:
+  README.md: |
+    # Spot Instance Strategy
+
+    ## Which services can run on spot?
+    ✅ order-service      (stateless, has preStop hook, PDB protects 2 replicas)
+    ✅ notification-service (stateless Kafka consumer, offset committed before shutdown)
+    ✅ analytics-service  (stateless, eventual consistency acceptable)
+    ❌ payment-service    (financial transactions — must not be interrupted mid-flight)
+    ❌ Redis              (stateful — use ElastiCache managed service instead)
+    ❌ Kafka brokers      (stateful — use MSK managed service instead)
+
+    ## How to enable spot for an EKS node group
+    In terraform/regions/<region>/main.tf, add a spot node group:
+
+    ```hcl
+    app_spot = {
+      name           = "app-spot"
+      instance_types = ["m5.xlarge", "m5a.xlarge", "m4.xlarge"]  # Multiple types = better availability
+      capacity_type  = "SPOT"
+      min_size       = 3
+      max_size       = 20
+      desired_size   = 6
+      labels         = { role = "app", capacity = "spot" }
+      taints         = []  # No taint — spot pods mix with on-demand
+    }
+    ```
+
+    ## Spot interruption handling
+    AWS gives a 2-minute warning before terminating a spot instance.
+    The Node Termination Handler (NTH) watches for this signal and:
+      1. Cordons the node (no new pods scheduled)
+      2. Drains the node (pods evicted gracefully)
+      3. PodDisruptionBudgets ensure minimum replicas stay up
+
+    Install NTH:
+      helm install aws-node-termination-handler \
+        eks/aws-node-termination-handler \
+        --namespace kube-system \
+        --set enableSpotInterruptionDraining=true \
+        --set enableRebalanceMonitoring=true
+
+    ## Expected savings
+    m5.xlarge on-demand: $0.192/hr
+    m5.xlarge spot:      $0.060/hr (avg — varies)
+    Savings:             ~69% on spot-eligible nodes
+
+    With 6 app nodes on spot vs on-demand:
+    Monthly savings: 6 nodes × ($0.192 - $0.060) × 730hr = ~$579/month
