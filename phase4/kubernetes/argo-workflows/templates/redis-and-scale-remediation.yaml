@@ -1,0 +1,344 @@
+# kubernetes/argo-workflows/templates/redis-and-scale-remediation.yaml
+
+---
+# ── Workflow: Redis Memory Remediation ────────────────────────────────────────
+# Trigger: Redis memory > 85%
+# Steps:
+#   1. Check current memory + eviction policy
+#   2. Switch eviction policy to allkeys-lru (safe — LRU eviction)
+#   3. If still > 90% — increase maxmemory by 25%
+#   4. Notify Slack with memory trend graph link
+
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: redis-memory-remediation
+  namespace: argo
+  annotations:
+    description: "Adjust Redis eviction policy and memory limits when memory pressure is high"
+spec:
+  serviceAccountName: argo-workflow-executor
+  entrypoint: remediate-redis
+  onExit: notify-slack
+
+  templates:
+
+    - name: remediate-redis
+      dag:
+        tasks:
+          - name: check-current-state
+            template: check-redis-state
+
+          - name: set-eviction-policy
+            template: set-eviction-policy
+            dependencies: [check-current-state]
+
+          - name: check-post-eviction
+            template: check-post-eviction
+            dependencies: [set-eviction-policy]
+
+          - name: increase-maxmemory-if-needed
+            template: increase-maxmemory
+            dependencies: [check-post-eviction]
+            when: "{{tasks.check-post-eviction.outputs.result}} == still-high"
+
+          - name: write-audit-log
+            template: write-audit-log
+            dependencies: [check-post-eviction]
+
+    - name: check-redis-state
+      script:
+        image: redis:7.2-alpine
+        command: [sh]
+        source: |
+          echo "🔍 Checking Redis memory state..."
+
+          REDIS_HOST="${REDIS_HOST:-redis.app.svc.cluster.local}"
+
+          redis-cli -h "$REDIS_HOST" info memory | grep -E \
+            "used_memory_human|maxmemory_human|mem_fragmentation_ratio|maxmemory_policy|evicted_keys"
+
+          echo "---"
+          POLICY=$(redis-cli -h "$REDIS_HOST" config get maxmemory-policy | tail -1)
+          echo "Current eviction policy: $POLICY"
+
+    - name: set-eviction-policy
+      script:
+        image: redis:7.2-alpine
+        command: [sh]
+        source: |
+          REDIS_HOST="${REDIS_HOST:-redis.app.svc.cluster.local}"
+
+          echo "⚙️ Setting eviction policy to allkeys-lru..."
+          echo "   → Least recently used keys will be evicted when memory is full"
+          echo "   → This is safe for our use case (order state also in PostgreSQL)"
+
+          redis-cli -h "$REDIS_HOST" config set maxmemory-policy allkeys-lru
+          redis-cli -h "$REDIS_HOST" config set activedefrag yes
+
+          RESULT=$(redis-cli -h "$REDIS_HOST" config get maxmemory-policy | tail -1)
+          echo "✅ Eviction policy set to: $RESULT"
+
+    - name: check-post-eviction
+      script:
+        image: redis:7.2-alpine
+        command: [sh]
+        source: |
+          REDIS_HOST="${REDIS_HOST:-redis.app.svc.cluster.local}"
+
+          sleep 10
+
+          USED=$(redis-cli -h "$REDIS_HOST" info memory | grep "used_memory:" | cut -d: -f2 | tr -d '\r')
+          MAX=$(redis-cli -h "$REDIS_HOST" config get maxmemory | tail -1)
+
+          echo "Used: $USED bytes | Max: $MAX bytes"
+
+          if [ -n "$MAX" ] && [ "$MAX" -gt 0 ]; then
+            RATIO=$(echo "scale=2; $USED / $MAX" | bc)
+            echo "Memory ratio: $RATIO"
+            if (( $(echo "$RATIO > 0.90" | bc -l) )); then
+              echo "⚠️ Still above 90% after eviction policy change"
+              echo -n "still-high"
+            else
+              echo "✅ Memory pressure relieved"
+              echo -n "ok"
+            fi
+          else
+            echo "⚠️ Could not determine max memory"
+            echo -n "ok"
+          fi
+
+    - name: increase-maxmemory
+      script:
+        image: redis:7.2-alpine
+        command: [sh]
+        source: |
+          REDIS_HOST="${REDIS_HOST:-redis.app.svc.cluster.local}"
+
+          CURRENT_MAX=$(redis-cli -h "$REDIS_HOST" config get maxmemory | tail -1)
+          NEW_MAX=$(echo "$CURRENT_MAX * 1.25 / 1" | bc)
+
+          echo "📈 Increasing Redis maxmemory by 25%"
+          echo "   Current: ${CURRENT_MAX} bytes"
+          echo "   New:     ${NEW_MAX} bytes"
+
+          redis-cli -h "$REDIS_HOST" config set maxmemory "${NEW_MAX}"
+          echo "✅ maxmemory updated to ${NEW_MAX} bytes"
+          echo "⚠️  IMPORTANT: Update the Kubernetes manifest to make this permanent!"
+
+    - name: write-audit-log
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          kubectl patch configmap remediation-audit-log -n argo \
+            --type merge \
+            -p "{\"data\":{\"${TIMESTAMP//:/}\": \"action=redis-eviction-policy-change policy=allkeys-lru\"}}" \
+            2>/dev/null || \
+          kubectl create configmap remediation-audit-log -n argo \
+            --from-literal="${TIMESTAMP//:/}=action=redis-eviction-policy-change"
+          echo "✅ Audit log written"
+
+    - name: notify-slack
+      script:
+        image: curlimages/curl:latest
+        command: [sh]
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook-secret
+                key: webhook-url
+        source: |
+          STATUS="{{workflow.status}}"
+          GRAFANA_URL="${GRAFANA_URL:-http://grafana.observability.svc.cluster.local}"
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"warning\",
+                \"title\": \"🔴 Auto-Remediation: Redis Memory Pressure\",
+                \"fields\": [
+                  {\"title\": \"Action Taken\", \"value\": \"Eviction policy → allkeys-lru\", \"short\": true},
+                  {\"title\": \"Status\", \"value\": \"$STATUS\", \"short\": true},
+                  {\"title\": \"Dashboard\", \"value\": \"$GRAFANA_URL/d/redis-performance\", \"short\": false},
+                  {\"title\": \"Next Step\", \"value\": \"Update maxmemory in K8s manifest if memory remains high\", \"short\": false}
+                ],
+                \"footer\": \"Argo Workflows | Autonomous Observability Platform\"
+              }]
+            }"
+
+---
+# ── Workflow: Predictive Scale ────────────────────────────────────────────────
+# Trigger: Request rate growing > 20% per minute
+# Steps:
+#   1. Calculate required replicas based on current rate + growth
+#   2. Scale deployment pre-emptively
+#   3. Verify pods are ready before traffic hits
+#   4. Notify Slack
+
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: predictive-scale-remediation
+  namespace: argo
+  annotations:
+    description: "Pre-emptively scale services when request rate growth is detected"
+spec:
+  serviceAccountName: argo-workflow-executor
+  entrypoint: scale
+  onExit: notify-slack
+
+  arguments:
+    parameters:
+      - name: service
+        value: order-service
+
+  templates:
+
+    - name: scale
+      dag:
+        tasks:
+          - name: calculate-target-replicas
+            template: calculate-replicas
+
+          - name: scale-deployment
+            template: scale-deployment
+            dependencies: [calculate-target-replicas]
+            arguments:
+              parameters:
+                - name: target-replicas
+                  value: "{{tasks.calculate-target-replicas.outputs.result}}"
+
+          - name: wait-for-ready
+            template: wait-for-ready
+            dependencies: [scale-deployment]
+
+          - name: write-audit-log
+            template: write-audit-log
+            dependencies: [wait-for-ready]
+            arguments:
+              parameters:
+                - name: replicas
+                  value: "{{tasks.calculate-target-replicas.outputs.result}}"
+
+    - name: calculate-replicas
+      script:
+        image: curlimages/curl:latest
+        command: [sh]
+        source: |
+          SERVICE="{{workflow.parameters.service}}"
+          PROMETHEUS_URL="http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
+
+          echo "📊 Calculating target replicas for $SERVICE..."
+
+          # Current RPS
+          CURRENT_RPS=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+            --data-urlencode "query=sum(rate(${SERVICE//-/_}_requests_total[1m]))" \
+            | grep -o '"value":\[.*\]' | grep -o '[0-9.]*"$' | tr -d '"')
+
+          echo "Current RPS: $CURRENT_RPS"
+
+          # Project 30% growth (20% detected + buffer)
+          PROJECTED_RPS=$(echo "$CURRENT_RPS * 1.30" | bc -l)
+          echo "Projected RPS (with buffer): $PROJECTED_RPS"
+
+          # Each pod handles ~50 RPS comfortably
+          RPS_PER_POD=50
+          TARGET=$(echo "($PROJECTED_RPS / $RPS_PER_POD + 0.9) / 1" | bc)
+
+          # Clamp between 3 and 20
+          if [ "$TARGET" -lt 3 ]; then TARGET=3; fi
+          if [ "$TARGET" -gt 20 ]; then TARGET=20; fi
+
+          echo "Target replicas: $TARGET"
+          echo -n "$TARGET"
+
+    - name: scale-deployment
+      inputs:
+        parameters:
+          - name: target-replicas
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          SERVICE="{{workflow.parameters.service}}"
+          NS="app"
+          TARGET="{{inputs.parameters.target-replicas}}"
+
+          CURRENT=$(kubectl get deployment "$SERVICE" -n "$NS" \
+            -o jsonpath='{.spec.replicas}')
+
+          echo "📈 Scaling $SERVICE: $CURRENT → $TARGET replicas"
+
+          if [ "$TARGET" -le "$CURRENT" ]; then
+            echo "✅ Already at or above target replicas. No action needed."
+            exit 0
+          fi
+
+          kubectl scale deployment "$SERVICE" -n "$NS" --replicas="$TARGET"
+          echo "✅ Scale command issued"
+
+    - name: wait-for-ready
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          SERVICE="{{workflow.parameters.service}}"
+          NS="app"
+
+          echo "⏳ Waiting for new pods to be ready..."
+          kubectl rollout status deployment/"$SERVICE" -n "$NS" --timeout=120s
+          echo "✅ All pods ready — traffic can be served"
+
+    - name: write-audit-log
+      inputs:
+        parameters:
+          - name: replicas
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          SERVICE="{{workflow.parameters.service}}"
+          REPLICAS="{{inputs.parameters.replicas}}"
+
+          kubectl patch configmap remediation-audit-log -n argo \
+            --type merge \
+            -p "{\"data\":{\"${TIMESTAMP//:/}\": \"action=predictive-scale service=$SERVICE target_replicas=$REPLICAS\"}}" \
+            2>/dev/null || \
+          kubectl create configmap remediation-audit-log -n argo \
+            --from-literal="${TIMESTAMP//:/}=action=predictive-scale service=$SERVICE target_replicas=$REPLICAS"
+          echo "✅ Audit log written"
+
+    - name: notify-slack
+      script:
+        image: curlimages/curl:latest
+        command: [sh]
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook-secret
+                key: webhook-url
+        source: |
+          SERVICE="{{workflow.parameters.service}}"
+          STATUS="{{workflow.status}}"
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"good\",
+                \"title\": \"📈 Auto-Remediation: Predictive Scale\",
+                \"fields\": [
+                  {\"title\": \"Service\", \"value\": \"$SERVICE\", \"short\": true},
+                  {\"title\": \"Status\", \"value\": \"$STATUS\", \"short\": true},
+                  {\"title\": \"Trigger\", \"value\": \"Request rate growing >20%/min\", \"short\": false},
+                  {\"title\": \"Action\", \"value\": \"Pre-emptively scaled before latency climbed\", \"short\": false}
+                ],
+                \"footer\": \"Argo Workflows | Scaled BEFORE users felt it\"
+              }]
+            }"
