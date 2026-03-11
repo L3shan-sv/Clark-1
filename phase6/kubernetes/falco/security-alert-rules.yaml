@@ -1,0 +1,137 @@
+# kubernetes/falco/security-alert-rules.yaml
+# Prometheus alert rules for the security layer.
+# These fire into the same Alertmanager — severity=critical goes to PagerDuty.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: security-alert-rules
+  namespace: security
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+
+    - name: security.falco
+      rules:
+
+        - alert: FalcoCriticalSecurityEvent
+          expr: |
+            increase(falco_events_total{priority="Critical"}[5m]) > 0
+          for: 0m    # Immediate — no waiting for security events
+          labels:
+            severity: critical
+            team: security
+            pagerduty: "true"
+          annotations:
+            summary: "🚨 Critical Falco security event in {{ $labels.k8s_pod_name }}"
+            description: |
+              A critical security rule has fired.
+              Rule: {{ $labels.rule }}
+              Pod: {{ $labels.k8s_pod_name }}
+              Namespace: {{ $labels.k8s_ns_name }}
+              Immediate investigation required.
+            runbook_url: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/security-alert.md"
+
+        - alert: FalcoWarningSecurityEvent
+          expr: |
+            increase(falco_events_total{priority="Warning"}[5m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+            team: security
+          annotations:
+            summary: "⚠️ Repeated Falco warnings in {{ $labels.k8s_pod_name }}"
+            description: "Multiple security warnings — may indicate probing or misconfiguration."
+
+    - name: security.vault
+      rules:
+
+        - alert: VaultSealedOrDown
+          expr: |
+            vault_core_unsealed == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "🚨 Vault is sealed — all secret injection will fail"
+            description: "Vault has sealed. Dynamic secret rotation is stopped. New pod startups will fail."
+
+        - alert: VaultSecretLeaseExpiring
+          expr: |
+            vault_secret_kv_count == 0
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⚠️ Vault secret leases may be expiring"
+            description: "No active KV secrets detected — check that app services are renewing leases."
+
+        - alert: VaultHighErrorRate
+          expr: |
+            rate(vault_audit_log_request_failure[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: security
+          annotations:
+            summary: "⚠️ Vault audit log failures"
+            description: "Vault audit failures — audit trail may be incomplete. Investigate immediately."
+
+    - name: security.opa
+      rules:
+
+        - alert: OPAConstraintViolation
+          expr: |
+            increase(gatekeeper_violations_total[1h]) > 0
+          for: 0m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⚠️ OPA Gatekeeper policy violation: {{ $labels.constraint }}"
+            description: |
+              A deployment was attempted that violates policy {{ $labels.constraint }}.
+              This was blocked. Investigate who attempted the deployment and why.
+
+        - alert: OPAGatekeeperDown
+          expr: |
+            absent(gatekeeper_violations_total)
+          for: 10m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "🚨 OPA Gatekeeper is down — security policies not enforced"
+            description: "Gatekeeper is not running. Insecure deployments can now reach production."
+
+    - name: security.supply-chain
+      rules:
+
+        - alert: UnsignedImageDeployed
+          expr: |
+            increase(policy_controller_admission_webhook_request_total{admitted="false"}[5m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+            team: security
+          annotations:
+            summary: "⚠️ Unsigned image deployment blocked by Policy Controller"
+            description: "An attempt was made to deploy an unsigned image. Policy Controller blocked it."
+
+        - alert: CriticalCVEInRunningImage
+          expr: |
+            grype_scan_vulnerabilities_total{severity="Critical"} > 0
+          for: 5m
+          labels:
+            severity: critical
+            team: security
+          annotations:
+            summary: "🚨 Critical CVE detected in running image: {{ $labels.image }}"
+            description: |
+              Image {{ $labels.image }} has {{ $value }} critical CVEs.
+              This image passed the build gate but a new CVE was discovered after deployment.
+              Schedule immediate patching and redeploy.
