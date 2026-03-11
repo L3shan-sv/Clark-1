@@ -1,0 +1,175 @@
+# kubernetes/argo-events/sensors/remediation-sensors.yaml
+# Sensors listen on the EventBus and trigger workflows when conditions match.
+# Each sensor handles one class of incident.
+
+---
+# ── Sensor 1: Pod CrashLooping ────────────────────────────────────────────────
+# Trigger: PodCrashLooping alert fires
+# Action:  Cordon node → drain pods → reschedule → notify Slack
+
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: pod-crashlooping-sensor
+  namespace: argo
+spec:
+  dependencies:
+    - name: crashloop-event
+      eventSourceName: alertmanager-webhook
+      eventName: pod-crashlooping
+      filters:
+        data:
+          # Only trigger for firing alerts (not resolved)
+          - path: body.status
+            type: string
+            value: ["firing"]
+
+  triggers:
+    - template:
+        name: pod-crashlooping-remediation
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: pod-crashloop-remediation-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: pod-crashloop-remediation
+          parameters:
+            - src:
+                dependencyName: crashloop-event
+                dataKey: body.alerts.0.labels.pod
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: crashloop-event
+                dataKey: body.alerts.0.labels.namespace
+              dest: spec.arguments.parameters.1.value
+
+---
+# ── Sensor 2: Deployment Error Spike ─────────────────────────────────────────
+# Trigger: Error rate > 1% within 5 minutes of a deployment
+# Action:  Auto rollback → Slack with deployment diff
+
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: deployment-error-spike-sensor
+  namespace: argo
+spec:
+  dependencies:
+    - name: error-spike-event
+      eventSourceName: alertmanager-webhook
+      eventName: deployment-error-spike
+      filters:
+        data:
+          - path: body.status
+            type: string
+            value: ["firing"]
+
+  triggers:
+    - template:
+        name: auto-rollback
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: auto-rollback-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: deployment-auto-rollback
+          parameters:
+            - src:
+                dependencyName: error-spike-event
+                dataKey: body.alerts.0.labels.service
+              dest: spec.arguments.parameters.0.value
+            - src:
+                dependencyName: error-spike-event
+                dataKey: body.alerts.0.labels.namespace
+              dest: spec.arguments.parameters.1.value
+
+---
+# ── Sensor 3: Redis Memory Pressure ──────────────────────────────────────────
+# Trigger: Redis memory > 85%
+# Action:  Adjust eviction policy → notify Slack with memory trend
+
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: redis-memory-sensor
+  namespace: argo
+spec:
+  dependencies:
+    - name: redis-memory-event
+      eventSourceName: alertmanager-webhook
+      eventName: redis-memory-high
+      filters:
+        data:
+          - path: body.status
+            type: string
+            value: ["firing"]
+
+  triggers:
+    - template:
+        name: redis-memory-remediation
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: redis-memory-remediation-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: redis-memory-remediation
+
+---
+# ── Sensor 4: Request Rate Surge ─────────────────────────────────────────────
+# Trigger: Request rate growing > 20% per minute
+# Action:  Pre-emptive scale → notify Slack
+
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: request-surge-sensor
+  namespace: argo
+spec:
+  dependencies:
+    - name: surge-event
+      eventSourceName: alertmanager-webhook
+      eventName: request-rate-surge
+      filters:
+        data:
+          - path: body.status
+            type: string
+            value: ["firing"]
+
+  triggers:
+    - template:
+        name: predictive-scale
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: predictive-scale-
+                namespace: argo
+              spec:
+                workflowTemplateRef:
+                  name: predictive-scale-remediation
+          parameters:
+            - src:
+                dependencyName: surge-event
+                dataKey: body.alerts.0.labels.service
+              dest: spec.arguments.parameters.0.value
