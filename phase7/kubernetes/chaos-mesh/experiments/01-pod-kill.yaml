@@ -1,0 +1,90 @@
+# kubernetes/chaos-mesh/experiments/01-pod-kill.yaml
+#
+# Experiment 1: Pod Kill — order-service
+#
+# Hypothesis:
+#   When 1 of 3 order-service pods is killed, Kubernetes will reschedule
+#   a replacement within 60 seconds. Traffic will briefly spike on the
+#   remaining pods (handled by HPA). The PodCrashLooping alert will NOT
+#   fire (single kill ≠ crash loop). Error rate will blip < 0.1% for
+#   < 30 seconds. SLO budget impact: < 0.5 minutes.
+#
+# What could go wrong (that's the point):
+#   - Readiness probe misconfigured → replacement pod never gets traffic
+#   - PodDisruptionBudget too loose → all pods killed simultaneously
+#   - HPA too slow → remaining pods get overloaded during reschedule
+#   - preStop hook missing → in-flight requests fail on pod termination
+
+---
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: exp01-order-service-pod-kill
+  namespace: chaos
+  annotations:
+    experiment.chaos/hypothesis: "Single pod kill recovers within 60s with < 0.1% error spike"
+    experiment.chaos/blast-radius: "1 pod out of 3 order-service replicas"
+    experiment.chaos/abort: "kubectl delete podchaos exp01-order-service-pod-kill -n chaos"
+spec:
+  action: pod-kill
+  mode: one           # Kill exactly ONE pod at a time
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: order-service
+  scheduler:
+    cron: "@once"     # Run once manually — use schedule for recurring
+
+---
+# ── PodDisruptionBudget — the safety net ─────────────────────────────────────
+# This PREVENTS chaos (and real failures) from killing more than 1 pod at once.
+# Without this, a node drain could take all pods down simultaneously.
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service-pdb
+  namespace: app
+spec:
+  minAvailable: 2    # Always keep at least 2 pods running
+  selector:
+    matchLabels:
+      app: order-service
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service-pdb
+  namespace: app
+spec:
+  minAvailable: 1    # Payment service: at least 1 always running
+  selector:
+    matchLabels:
+      app: payment-service
+
+---
+# ── Experiment 1b: Pod Failure (OOMKill simulation) ───────────────────────────
+# Simulates an OOMKilled pod — tests that:
+#   1. OOMKill Falco alert fires
+#   2. Pod restarts successfully
+#   3. Memory limits in manifest are appropriate
+#   4. No data corruption from abrupt termination
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: exp01b-pod-failure-oomkill
+  namespace: chaos
+  annotations:
+    experiment.chaos/hypothesis: "OOMKilled pod restarts cleanly, Falco alert fires, no data corruption"
+spec:
+  action: pod-failure    # Marks pod as failed (simulates OOMKill)
+  mode: one
+  duration: "30s"        # Pod is failed for 30 seconds then recovers
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: analytics-service    # Analytics is stateless — safe to kill
