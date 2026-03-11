@@ -1,0 +1,231 @@
+# kubernetes/argo-workflows/templates/deployment-auto-rollback.yaml
+# Workflow: Deployment Auto-Rollback
+#
+# Trigger: Error rate > 1% within 5 minutes of a deployment
+#
+# Steps:
+#   1. Verify — confirm error rate is actually elevated AND recent deployment exists
+#   2. Capture diff — get what changed between current and previous revision
+#   3. Rollback — kubectl rollout undo
+#   4. Verify — confirm error rate drops after rollback
+#   5. Notify — Slack with full deployment diff
+#   6. Audit — log the rollback
+
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: deployment-auto-rollback
+  namespace: argo
+  annotations:
+    description: "Auto-rollback a deployment when error rate spikes within 5 minutes of deploy"
+spec:
+  serviceAccountName: argo-workflow-executor
+  entrypoint: rollback
+  onExit: notify-slack
+
+  arguments:
+    parameters:
+      - name: service
+        value: order-service
+      - name: namespace
+        value: app
+
+  templates:
+
+    - name: rollback
+      dag:
+        tasks:
+          - name: verify-error-spike
+            template: verify-error-spike
+
+          - name: capture-deployment-diff
+            template: capture-deployment-diff
+            dependencies: [verify-error-spike]
+
+          - name: execute-rollback
+            template: execute-rollback
+            dependencies: [capture-deployment-diff]
+
+          - name: verify-recovery
+            template: verify-recovery
+            dependencies: [execute-rollback]
+
+          - name: write-audit-log
+            template: write-audit-log
+            dependencies: [verify-recovery]
+            arguments:
+              parameters:
+                - name: diff
+                  value: "{{tasks.capture-deployment-diff.outputs.result}}"
+
+    # ── Step 1: Verify the error spike is real ────────────────────────────────
+    - name: verify-error-spike
+      script:
+        image: curlimages/curl:latest
+        command: [sh]
+        source: |
+          SERVICE="{{workflow.parameters.service}}"
+          PROMETHEUS_URL="http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
+
+          echo "🔍 Querying Prometheus for current error rate..."
+
+          ERROR_RATE=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+            --data-urlencode "query=sum(rate(${SERVICE//-/_}_requests_total{status_code=~\"5..\"}[5m])) / sum(rate(${SERVICE//-/_}_requests_total[5m]))" \
+            | grep -o '"value":\[.*\]' | grep -o '[0-9.]*"$' | tr -d '"')
+
+          echo "Current error rate: $ERROR_RATE"
+
+          # Check if error rate > 1% (0.01)
+          ABOVE_THRESHOLD=$(echo "$ERROR_RATE > 0.01" | bc -l 2>/dev/null || echo "1")
+
+          if [ "$ABOVE_THRESHOLD" != "1" ]; then
+            echo "⚠️ Error rate ($ERROR_RATE) is below 1% threshold. Alert may be resolving."
+            echo "    Aborting rollback to avoid unnecessary disruption."
+            exit 1
+          fi
+
+          echo "✅ Error rate confirmed above threshold — proceeding with rollback"
+
+    # ── Step 2: Capture deployment diff for Slack notification ───────────────
+    - name: capture-deployment-diff
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          SERVICE="{{workflow.parameters.service}}"
+          NS="{{workflow.parameters.namespace}}"
+
+          echo "📋 Capturing deployment history..."
+
+          # Get current and previous revision details
+          CURRENT_REV=$(kubectl rollout history deployment/"$SERVICE" -n "$NS" \
+            | tail -2 | head -1 | awk '{print $1}')
+
+          PREV_REV=$((CURRENT_REV - 1))
+
+          echo "Current revision: $CURRENT_REV"
+          echo "Rolling back to revision: $PREV_REV"
+
+          # Get the image tags for both revisions
+          CURRENT_IMAGE=$(kubectl get deployment "$SERVICE" -n "$NS" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+          echo "Current image: $CURRENT_IMAGE"
+          echo "Rollback target: revision $PREV_REV"
+
+          # Full rollout history for context
+          kubectl rollout history deployment/"$SERVICE" -n "$NS"
+
+          # Output for use in Slack notification
+          echo -n "Service: $SERVICE | Current: $CURRENT_IMAGE | Rolling back to revision: $PREV_REV"
+
+    # ── Step 3: Execute rollback ──────────────────────────────────────────────
+    - name: execute-rollback
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          SERVICE="{{workflow.parameters.service}}"
+          NS="{{workflow.parameters.namespace}}"
+
+          echo "⏪ Executing rollback for $SERVICE in $NS..."
+          kubectl rollout undo deployment/"$SERVICE" -n "$NS"
+
+          echo "⏳ Waiting for rollback to complete..."
+          kubectl rollout status deployment/"$SERVICE" -n "$NS" --timeout=120s
+
+          echo "✅ Rollback complete"
+
+    # ── Step 4: Verify error rate drops post-rollback ─────────────────────────
+    - name: verify-recovery
+      script:
+        image: curlimages/curl:latest
+        command: [sh]
+        source: |
+          SERVICE="{{workflow.parameters.service}}"
+          PROMETHEUS_URL="http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
+
+          echo "⏳ Waiting 60 seconds for error rate to stabilise..."
+          sleep 60
+
+          ERROR_RATE=$(curl -s "$PROMETHEUS_URL/api/v1/query" \
+            --data-urlencode "query=sum(rate(${SERVICE//-/_}_requests_total{status_code=~\"5..\"}[5m])) / sum(rate(${SERVICE//-/_}_requests_total[5m]))" \
+            | grep -o '"value":\[.*\]' | grep -o '[0-9.]*"$' | tr -d '"')
+
+          echo "Post-rollback error rate: $ERROR_RATE"
+
+          STILL_HIGH=$(echo "${ERROR_RATE:-0} > 0.01" | bc -l 2>/dev/null || echo "0")
+
+          if [ "$STILL_HIGH" = "1" ]; then
+            echo "⚠️ Error rate still elevated after rollback: $ERROR_RATE"
+            echo "    Root cause may not be the deployment."
+            echo "    Manual investigation required."
+            echo -n "error-rate-still-high"
+          else
+            echo "✅ Error rate recovered: $ERROR_RATE"
+            echo -n "recovered"
+          fi
+
+    # ── Step 5: Write audit log ───────────────────────────────────────────────
+    - name: write-audit-log
+      inputs:
+        parameters:
+          - name: diff
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          SERVICE="{{workflow.parameters.service}}"
+          DIFF="{{inputs.parameters.diff}}"
+
+          kubectl patch configmap remediation-audit-log -n argo \
+            --type merge \
+            -p "{\"data\":{\"${TIMESTAMP//:/}\": \"action=auto-rollback service=$SERVICE diff=$DIFF\"}}" \
+            2>/dev/null || \
+          kubectl create configmap remediation-audit-log -n argo \
+            --from-literal="${TIMESTAMP//:/}=action=auto-rollback service=$SERVICE"
+
+          echo "✅ Rollback recorded in audit log"
+
+    # ── Exit Handler: Notify Slack ────────────────────────────────────────────
+    - name: notify-slack
+      script:
+        image: curlimages/curl:latest
+        command: [sh]
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook-secret
+                key: webhook-url
+        source: |
+          SERVICE="{{workflow.parameters.service}}"
+          STATUS="{{workflow.status}}"
+
+          if [ "$STATUS" = "Succeeded" ]; then
+            EMOJI="⏪"
+            COLOR="warning"
+            MESSAGE="Deployment automatically rolled back due to error rate spike. Service is recovering."
+          else
+            EMOJI="🚨"
+            COLOR="danger"
+            MESSAGE="AUTO-ROLLBACK FAILED. Service still degraded. MANUAL INTERVENTION REQUIRED."
+          fi
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"title\": \"$EMOJI Auto-Remediation: Deployment Rollback\",
+                \"fields\": [
+                  {\"title\": \"Service\", \"value\": \"$SERVICE\", \"short\": true},
+                  {\"title\": \"Status\", \"value\": \"$STATUS\", \"short\": true},
+                  {\"title\": \"Trigger\", \"value\": \"Error rate > 1% within 5min of deploy\", \"short\": false},
+                  {\"title\": \"Action\", \"value\": \"kubectl rollout undo\", \"short\": true},
+                  {\"title\": \"Message\", \"value\": \"$MESSAGE\", \"short\": false}
+                ],
+                \"footer\": \"Argo Workflows | Check audit log for full diff\"
+              }]
+            }"
