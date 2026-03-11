@@ -1,0 +1,426 @@
+# kubernetes/ml/ml-deployments.yaml
+# Kubernetes manifests for all Phase 5 ML services.
+# All run on the ml node group (memory-optimised instances).
+# Each exposes a /metrics endpoint scraped by Prometheus.
+
+---
+# ── Traffic Forecaster ────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-forecaster
+  namespace: ml
+  labels:
+    app: traffic-forecaster
+    version: v1
+spec:
+  replicas: 1   # Stateless — one replica is fine (cronjob-like)
+  selector:
+    matchLabels:
+      app: traffic-forecaster
+  template:
+    metadata:
+      labels:
+        app: traffic-forecaster
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+    spec:
+      serviceAccountName: ml-service-account
+      nodeSelector:
+        role: ml
+      tolerations:
+        - key: ml
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: forecaster
+          image: your-registry/traffic-forecaster:latest
+          ports:
+            - containerPort: 8001   # Prometheus metrics
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: url
+            - name: FORECAST_HORIZON_MINUTES
+              value: "30"
+            - name: RETRAIN_INTERVAL_MINUTES
+              value: "60"
+            - name: TRAINING_DAYS
+              value: "90"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "2Gi"    # Prophet + pandas needs memory
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 8001
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 8001
+            initialDelaySeconds: 120   # First training takes time
+            periodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: traffic-forecaster
+  namespace: ml
+spec:
+  selector:
+    app: traffic-forecaster
+  ports:
+    - port: 8001
+      targetPort: 8001
+
+---
+# ── Anomaly Detector ──────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anomaly-detector
+  namespace: ml
+  labels:
+    app: anomaly-detector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: anomaly-detector
+  template:
+    metadata:
+      labels:
+        app: anomaly-detector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8002"
+    spec:
+      serviceAccountName: ml-service-account
+      nodeSelector:
+        role: ml
+      tolerations:
+        - key: ml
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: detector
+          image: your-registry/anomaly-detector:latest
+          ports:
+            - containerPort: 8002
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: url
+            - name: ALERT_WEBHOOK
+              value: "http://alertmanager-webhook-eventsource-svc.argo.svc.cluster.local:12000/anomaly-detected"
+            - name: CONFIDENCE_THRESHOLD
+              value: "0.75"
+            - name: SCAN_INTERVAL_SECONDS
+              value: "60"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "3Gi"    # LSTM autoencoder is memory intensive
+            limits:
+              cpu: "2000m"
+              memory: "6Gi"
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 8002
+            initialDelaySeconds: 120
+            periodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anomaly-detector
+  namespace: ml
+spec:
+  selector:
+    app: anomaly-detector
+  ports:
+    - port: 8002
+      targetPort: 8002
+
+---
+# ── Causal Engine ─────────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: causal-engine
+  namespace: ml
+  labels:
+    app: causal-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: causal-engine
+  template:
+    metadata:
+      labels:
+        app: causal-engine
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: ml-service-account
+      nodeSelector:
+        role: ml
+      tolerations:
+        - key: ml
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: causal-engine
+          image: your-registry/causal-engine:latest
+          ports:
+            - containerPort: 8000   # FastAPI
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: slack-webhook-secret
+                  key: webhook-url
+            - name: GRAFANA_URL
+              value: "http://kube-prometheus-stack-grafana.observability.svc.cluster.local"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: causal-engine
+  namespace: ml
+spec:
+  selector:
+    app: causal-engine
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+# ── RL Agent ──────────────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rl-agent
+  namespace: ml
+  labels:
+    app: rl-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rl-agent
+  template:
+    metadata:
+      labels:
+        app: rl-agent
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      serviceAccountName: ml-service-account
+      nodeSelector:
+        role: ml
+      tolerations:
+        - key: ml
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: rl-agent
+          image: your-registry/rl-agent:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: url
+            # START IN SHADOW MODE — graduate manually after 50+ observations
+            - name: SHADOW_MODE
+              value: "true"
+            - name: AUTO_GRADUATE_OBSERVATIONS
+              value: "50"
+            - name: AUTO_GRADUATE_SUCCESS_RATE
+              value: "0.70"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rl-agent
+  namespace: ml
+spec:
+  selector:
+    app: rl-agent
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+# ── Drift Detector ────────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drift-detector
+  namespace: ml
+  labels:
+    app: drift-detector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: drift-detector
+  template:
+    metadata:
+      labels:
+        app: drift-detector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8003"
+    spec:
+      serviceAccountName: ml-service-account
+      nodeSelector:
+        role: ml
+      tolerations:
+        - key: ml
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: drift-detector
+          image: your-registry/drift-detector:latest
+          ports:
+            - containerPort: 8003
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090"
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: url
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: slack-webhook-secret
+                  key: webhook-url
+            - name: CHECK_INTERVAL_SECONDS
+              value: "3600"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drift-detector
+  namespace: ml
+spec:
+  selector:
+    app: drift-detector
+  ports:
+    - port: 8003
+      targetPort: 8003
+
+---
+# ── RBAC ──────────────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ml-service-account
+  namespace: ml
+
+---
+# ML services only need read access — they observe but don't mutate
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ml-observer
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ml-observer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ml-observer
+subjects:
+  - kind: ServiceAccount
+    name: ml-service-account
+    namespace: ml
