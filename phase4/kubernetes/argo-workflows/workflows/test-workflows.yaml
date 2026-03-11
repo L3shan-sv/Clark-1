@@ -1,0 +1,35 @@
+# kubernetes/argo-workflows/workflows/test-rollback.yaml
+# Use this to test the auto-rollback workflow manually without waiting for an alert.
+# Safe — it verifies error rate before executing. Will abort if error rate is normal.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: test-auto-rollback-
+  namespace: argo
+spec:
+  workflowTemplateRef:
+    name: deployment-auto-rollback
+  arguments:
+    parameters:
+      - name: service
+        value: order-service
+      - name: namespace
+        value: app
+
+---
+# Test pod crashloop remediation (safe — verifies restarts > 3 before acting)
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: test-crashloop-
+  namespace: argo
+spec:
+  workflowTemplateRef:
+    name: pod-crashloop-remediation
+  arguments:
+    parameters:
+      - name: pod-name
+        value: "REPLACE_WITH_REAL_POD_NAME"
+      - name: namespace
+        value: app
