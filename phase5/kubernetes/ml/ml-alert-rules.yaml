@@ -1,0 +1,99 @@
+# kubernetes/ml/ml-alert-rules.yaml
+# Alerts for the ML layer itself — "observability of observability"
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ml-alert-rules
+  namespace: ml
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+
+    - name: ml.anomaly-detector
+      rules:
+
+        - alert: AnomalyDetectorDown
+          expr: absent(ml_anomalies_detected_total)
+          for: 10m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "🚨 Anomaly detector is not running"
+            description: "No anomaly detection metrics for 10 minutes — detector may be down."
+
+        - alert: AnomalyDetectorHighFalsePositives
+          expr: |
+            rate(ml_anomalies_detected_total[1h]) > 10
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⚠️ Anomaly detector firing excessively (possible false positives)"
+            description: |
+              {{ $value | humanize }} anomalies/hr detected — may indicate model drift
+              or confidence threshold is too low. Review CONFIDENCE_THRESHOLD setting.
+
+    - name: ml.traffic-forecaster
+      rules:
+
+        - alert: ForecastMAPEHigh
+          expr: ml_forecast_mape_percent > 30
+          for: 30m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⚠️ Traffic forecast MAPE > 30% for {{ $labels.service }}"
+            description: |
+              Forecast error for {{ $labels.service }} is {{ $value }}%.
+              Predictive scaling may be inaccurate. Model may need retraining.
+
+        - alert: ForecasterDown
+          expr: absent(ml_forecast_predicted_rps)
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⚠️ Traffic forecaster is not producing predictions"
+            description: "No forecast metrics for 15 minutes. Predictive scaling is disabled."
+
+    - name: ml.drift-detection
+      rules:
+
+        - alert: ModelDriftCritical
+          expr: ml_drift_alert_active == 1
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "🔄 ML model drift detected: {{ $labels.model }}"
+            description: |
+              Model {{ $labels.model }} has significant data or concept drift.
+              PSI score: {{ $value }}. Model has been flagged for retraining.
+              Predictions from this model may be less reliable until retrained.
+
+    - name: ml.rl-agent
+      rules:
+
+        - alert: RLAgentReadyToGraduate
+          expr: |
+            ml_agent_observations_total > 50
+            and
+            (ml_agent_action_successes_total / (ml_agent_action_successes_total + ml_agent_action_failures_total)) > 0.70
+          for: 5m
+          labels:
+            severity: info
+            team: platform
+          annotations:
+            summary: "🎓 RL agent ready to graduate from shadow to auto mode"
+            description: |
+              The RL remediation agent has {{ $value }} observations with >70% success rate.
+              Consider setting SHADOW_MODE=false to enable autonomous remediation.
+              Review the policy dashboard before graduating: http://rl-agent.ml/policy
