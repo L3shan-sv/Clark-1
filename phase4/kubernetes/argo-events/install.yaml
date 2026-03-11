@@ -1,0 +1,97 @@
+# kubernetes/argo-events/install.yaml
+# Argo Events — detects events (Alertmanager webhooks)
+# Argo Workflows — executes remediation in response
+
+---
+# ── Namespace already created in Phase 0 (argo) ──────────────────────────────
+
+# ── RBAC — Argo Workflows needs permission to act on the cluster ──────────────
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argo-workflow-executor
+  namespace: argo
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argo-workflow-executor
+rules:
+  # Read pods and deployments to assess health
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/exec"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Rollback = update deployment revision
+  - apiGroups: ["apps"]
+    resources: ["deployments/rollback"]
+    verbs: ["create", "update"]
+  # Cordon/drain nodes
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch", "update"]
+  # Create/update configmaps for audit logging
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
+  # Read secrets (for Slack webhook)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  # Argo Workflows internal
+  - apiGroups: ["argoproj.io"]
+    resources: ["workflows", "workflowtemplates"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argo-workflow-executor
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argo-workflow-executor
+subjects:
+  - kind: ServiceAccount
+    name: argo-workflow-executor
+    namespace: argo
+
+---
+# ── Argo Events — EventBus (NATS-based internal message bus) ─────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: EventBus
+metadata:
+  name: default
+  namespace: argo
+spec:
+  nats:
+    native:
+      replicas: 3
+      auth: token
+
+---
+# ── Argo Workflows ConfigMap ───────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workflow-controller-configmap
+  namespace: argo
+data:
+  # Keep workflow history for audit trail
+  workflowDefaults: |
+    spec:
+      ttlStrategy:
+        secondsAfterCompletion: 604800   # 7 days
+        secondsAfterSuccess: 604800
+        secondsAfterFailure: 2592000     # 30 days (failures kept longer)
+      podGC:
+        strategy: OnPodCompletion
+  # Archive all workflows to audit log
+  persistence: |
+    archive: true
+    archiveTTL: 90d
