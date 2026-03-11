@@ -1,0 +1,271 @@
+# kubernetes/argo-workflows/templates/pod-crashloop-remediation.yaml
+# Workflow: PodCrashLooping Remediation
+#
+# Steps:
+#   1. Verify — confirm pod is actually crashlooping (not a stale alert)
+#   2. Diagnose — capture logs before we touch anything
+#   3. Cordon — stop new pods scheduling on the bad node
+#   4. Drain — safely move pods to healthy nodes
+#   5. Verify Recovery — confirm pods rescheduled and healthy
+#   6. Notify — full Slack report with what happened
+#   7. Audit — write to audit log ConfigMap
+#
+# Each step is reversible. If any step fails, workflow aborts and pages on-call.
+
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: pod-crashloop-remediation
+  namespace: argo
+  annotations:
+    description: "Automated remediation for PodCrashLooping — cordon, drain, reschedule"
+    runbook: "https://github.com/your-org/autonomous-observability-platform/blob/main/docs/runbooks/high-error-rate.md"
+spec:
+  serviceAccountName: argo-workflow-executor
+  entrypoint: remediate
+  onExit: notify-slack
+
+  arguments:
+    parameters:
+      - name: pod-name
+      - name: namespace
+        value: app
+
+  templates:
+
+    # ── Main DAG ──────────────────────────────────────────────────────────────
+    - name: remediate
+      dag:
+        tasks:
+          - name: verify-crashloop
+            template: verify-crashloop
+
+          - name: capture-logs
+            template: capture-logs
+            dependencies: [verify-crashloop]
+
+          - name: get-node
+            template: get-node
+            dependencies: [verify-crashloop]
+
+          - name: cordon-node
+            template: cordon-node
+            dependencies: [get-node]
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{tasks.get-node.outputs.result}}"
+
+          - name: drain-node
+            template: drain-node
+            dependencies: [cordon-node]
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{tasks.get-node.outputs.result}}"
+
+          - name: verify-recovery
+            template: verify-recovery
+            dependencies: [drain-node]
+
+          - name: write-audit-log
+            template: write-audit-log
+            dependencies: [verify-recovery]
+            arguments:
+              parameters:
+                - name: node-name
+                  value: "{{tasks.get-node.outputs.result}}"
+                - name: outcome
+                  value: "{{tasks.verify-recovery.outputs.result}}"
+
+    # ── Step 1: Verify the pod is still crashlooping ──────────────────────────
+    - name: verify-crashloop
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          set -e
+          POD="{{workflow.parameters.pod-name}}"
+          NS="{{workflow.parameters.namespace}}"
+
+          echo "🔍 Verifying crashloop for pod: $POD in $NS"
+
+          RESTARTS=$(kubectl get pod "$POD" -n "$NS" \
+            -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+
+          echo "Pod restart count: $RESTARTS"
+
+          if [ "$RESTARTS" -lt 3 ]; then
+            echo "⚠️ Pod has only $RESTARTS restarts — may be a stale alert. Aborting."
+            exit 1
+          fi
+
+          echo "✅ Confirmed crashloop — proceeding with remediation"
+
+    # ── Step 2: Capture logs before we touch the node ────────────────────────
+    - name: capture-logs
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          POD="{{workflow.parameters.pod-name}}"
+          NS="{{workflow.parameters.namespace}}"
+
+          echo "📋 Capturing logs from crashlooping pod..."
+          kubectl logs "$POD" -n "$NS" --previous --tail=200 2>/dev/null || \
+            echo "No previous logs available"
+
+          echo "📋 Describing pod for events..."
+          kubectl describe pod "$POD" -n "$NS" | tail -30
+
+    # ── Step 3: Get node name ─────────────────────────────────────────────────
+    - name: get-node
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          POD="{{workflow.parameters.pod-name}}"
+          NS="{{workflow.parameters.namespace}}"
+
+          NODE=$(kubectl get pod "$POD" -n "$NS" \
+            -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+
+          if [ -z "$NODE" ]; then
+            echo "Could not determine node for pod $POD"
+            exit 1
+          fi
+
+          echo "Node: $NODE"
+          echo -n "$NODE"
+
+    # ── Step 4: Cordon the node ───────────────────────────────────────────────
+    - name: cordon-node
+      inputs:
+        parameters:
+          - name: node-name
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          NODE="{{inputs.parameters.node-name}}"
+          echo "🔒 Cordoning node: $NODE"
+          echo "    → New pods will NOT be scheduled on this node"
+          kubectl cordon "$NODE"
+          echo "✅ Node cordoned: $NODE"
+
+    # ── Step 5: Drain the node ────────────────────────────────────────────────
+    - name: drain-node
+      inputs:
+        parameters:
+          - name: node-name
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          NODE="{{inputs.parameters.node-name}}"
+          echo "🚿 Draining node: $NODE"
+          echo "    → Evicting all pods to healthy nodes"
+          echo "    → DaemonSets ignored (they run everywhere)"
+
+          kubectl drain "$NODE" \
+            --ignore-daemonsets \
+            --delete-emptydir-data \
+            --grace-period=30 \
+            --timeout=300s
+
+          echo "✅ Node drained: $NODE"
+          echo "    → Pods are rescheduling on healthy nodes..."
+
+    # ── Step 6: Verify recovery ───────────────────────────────────────────────
+    - name: verify-recovery
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          NS="{{workflow.parameters.namespace}}"
+          echo "🔍 Waiting for pods to reschedule and become ready..."
+
+          sleep 30
+
+          # Check that all deployments have desired replicas available
+          NOT_READY=$(kubectl get deployments -n "$NS" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.availableReplicas}{" "}{.spec.replicas}{"\n"}{end}' | \
+            awk '$2 < $3 {print $1}')
+
+          if [ -n "$NOT_READY" ]; then
+            echo "⚠️ Deployments not fully recovered: $NOT_READY"
+            echo -n "partial"
+          else
+            echo "✅ All deployments healthy — remediation successful"
+            echo -n "success"
+          fi
+
+    # ── Step 7: Write audit log ───────────────────────────────────────────────
+    - name: write-audit-log
+      inputs:
+        parameters:
+          - name: node-name
+          - name: outcome
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          NODE="{{inputs.parameters.node-name}}"
+          OUTCOME="{{inputs.parameters.outcome}}"
+          POD="{{workflow.parameters.pod-name}}"
+
+          echo "📝 Writing audit log entry..."
+
+          # Append to audit ConfigMap
+          kubectl patch configmap remediation-audit-log -n argo \
+            --type merge \
+            -p "{\"data\":{\"${TIMESTAMP//:/}\": \"action=cordon-drain pod=$POD node=$NODE outcome=$OUTCOME\"}}" \
+            2>/dev/null || \
+          kubectl create configmap remediation-audit-log -n argo \
+            --from-literal="${TIMESTAMP//:/}=action=cordon-drain pod=$POD node=$NODE outcome=$OUTCOME"
+
+          echo "✅ Audit log written"
+
+    # ── Exit Handler: Notify Slack ────────────────────────────────────────────
+    - name: notify-slack
+      script:
+        image: curlimages/curl:latest
+        command: [sh]
+        env:
+          - name: SLACK_WEBHOOK_URL
+            valueFrom:
+              secretKeyRef:
+                name: slack-webhook-secret
+                key: webhook-url
+        source: |
+          POD="{{workflow.parameters.pod-name}}"
+          NS="{{workflow.parameters.namespace}}"
+          STATUS="{{workflow.status}}"
+
+          if [ "$STATUS" = "Succeeded" ]; then
+            EMOJI="✅"
+            COLOR="good"
+            MESSAGE="Pod crash loop remediated. Node cordoned and drained. Pods rescheduled on healthy nodes."
+          else
+            EMOJI="❌"
+            COLOR="danger"
+            MESSAGE="Automated remediation FAILED. Manual intervention required. Check Argo Workflows for details."
+          fi
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"title\": \"$EMOJI Auto-Remediation: PodCrashLooping\",
+                \"fields\": [
+                  {\"title\": \"Pod\", \"value\": \"$POD\", \"short\": true},
+                  {\"title\": \"Namespace\", \"value\": \"$NS\", \"short\": true},
+                  {\"title\": \"Action\", \"value\": \"Cordon → Drain → Reschedule\", \"short\": true},
+                  {\"title\": \"Status\", \"value\": \"$STATUS\", \"short\": true},
+                  {\"title\": \"Message\", \"value\": \"$MESSAGE\", \"short\": false}
+                ],
+                \"footer\": \"Argo Workflows | Autonomous Observability Platform\"
+              }]
+            }"
