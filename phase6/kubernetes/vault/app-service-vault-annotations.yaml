@@ -1,0 +1,103 @@
+# kubernetes/vault/app-service-vault-annotations.yaml
+# Vault Agent Injector annotations.
+# Add these to your Deployment pod templates (Phase 1 manifests).
+# The injector sidecar pulls secrets at pod startup and rotates them before expiry.
+# Your app reads from files — zero code changes needed.
+#
+# Secret lifecycle:
+#   Pod starts → Vault Agent init container runs → authenticates with K8s SA token
+#   → fetches DB credentials → writes to /vault/secrets/db-creds
+#   → app starts → reads credentials from file
+#   → Vault Agent rotates credentials before TTL expires (no restart needed)
+
+---
+# ── Order Service — Vault annotations ────────────────────────────────────────
+# Merge these annotations into the existing order-service Deployment
+# (kubernetes/app/deployments.yaml from Phase 1)
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: app
+spec:
+  template:
+    metadata:
+      annotations:
+        # Enable injection
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "app-services"
+        vault.hashicorp.com/agent-pre-populate-only: "false"   # Keep rotating
+        vault.hashicorp.com/agent-inject-token: "false"
+
+        # Inject DB credentials as a file
+        vault.hashicorp.com/agent-inject-secret-db-creds: "database/creds/app-services"
+        vault.hashicorp.com/agent-inject-template-db-creds: |
+          {{- with secret "database/creds/app-services" -}}
+          DATABASE_URL=postgresql://{{ .Data.username }}:{{ .Data.password }}@postgresql.app.svc.cluster.local:5432/appdb?sslmode=require
+          {{- end }}
+
+        # Inject Kafka credentials
+        vault.hashicorp.com/agent-inject-secret-kafka-creds: "secret/data/app/kafka"
+        vault.hashicorp.com/agent-inject-template-kafka-creds: |
+          {{- with secret "secret/data/app/kafka" -}}
+          KAFKA_SASL_USERNAME={{ .Data.data.username }}
+          KAFKA_SASL_PASSWORD={{ .Data.data.password }}
+          {{- end }}
+
+        # Inject TLS cert for mTLS
+        vault.hashicorp.com/agent-inject-secret-tls: "pki_int/issue/app-services"
+        vault.hashicorp.com/agent-inject-template-tls: |
+          {{- with secret "pki_int/issue/app-services" "common_name=order-service.app.svc.cluster.local" "ttl=24h" -}}
+          {{ .Data.certificate }}
+          {{ .Data.issuing_ca }}
+          {{- end }}
+
+        # Audit log — every secret access is logged with pod identity
+        vault.hashicorp.com/agent-inject-command-db-creds: |
+          /bin/sh -c "echo 'DB credentials rotated at $(date)' >> /var/log/vault-rotations.log"
+
+    spec:
+      serviceAccountName: order-service   # This SA is bound to app-services Vault role
+      containers:
+        - name: order-service
+          env:
+            # App reads from Vault-injected files at startup
+            - name: VAULT_SECRET_PATH
+              value: "/vault/secrets"
+            - name: DB_CREDENTIALS_FILE
+              value: "/vault/secrets/db-creds"
+            # No DATABASE_URL in env — it comes from the file
+            # This means it's never visible in `kubectl describe pod`
+
+---
+# ── Payment Service — tighter Vault config ────────────────────────────────────
+# Payment service gets shorter credential TTLs (30 min vs 1h)
+# and a dedicated Vault role with minimal permissions.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: app
+spec:
+  template:
+    metadata:
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "app-services"
+
+        # DB credentials — 30 min TTL for payment service (tighter)
+        vault.hashicorp.com/agent-inject-secret-db-creds: "database/creds/app-services"
+        vault.hashicorp.com/agent-inject-template-db-creds: |
+          {{- with secret "database/creds/app-services" -}}
+          DATABASE_URL=postgresql://{{ .Data.username }}:{{ .Data.password }}@postgresql.app.svc.cluster.local:5432/appdb?sslmode=require
+          {{- end }}
+
+        # Fraud detection API key
+        vault.hashicorp.com/agent-inject-secret-fraud-api: "secret/data/app/fraud-detection"
+        vault.hashicorp.com/agent-inject-template-fraud-api: |
+          {{- with secret "secret/data/app/fraud-detection" -}}
+          FRAUD_API_KEY={{ .Data.data.api_key }}
+          FRAUD_API_URL={{ .Data.data.api_url }}
+          {{- end }}
