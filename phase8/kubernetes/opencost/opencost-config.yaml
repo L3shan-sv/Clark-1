@@ -1,0 +1,206 @@
+# kubernetes/opencost/opencost-config.yaml
+#
+# OpenCost — real-time Kubernetes cost monitoring.
+#
+# What we're solving:
+#   Engineers say "we need more memory" and just bump the limit.
+#   Nobody tracks what that costs. Nobody knows which service
+#   consumes 60% of the cluster bill. Nobody can answer
+#   "how much does it cost to process one order?"
+#
+# After this phase, we can answer:
+#   - Cost per request per service ($/1000 requests)
+#   - Cost per SLO point maintained
+#   - Which pods are overprovisioned (waste)
+#   - Which teams own which spend
+#   - 30-day cost forecast vs budget
+#
+# OpenCost scrapes AWS pricing API + K8s resource usage
+# → allocates costs to namespaces/deployments/pods
+# → exposes as Prometheus metrics
+# → we build dashboards + alerts on top
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cost
+  labels:
+    app.kubernetes.io/component: opencost
+
+---
+# ── OpenCost Helm values ──────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opencost-helm-values-reference
+  namespace: cost
+  annotations:
+    note: "helm upgrade --install opencost opencost/opencost -n cost -f opencost-values.yaml"
+data:
+  opencost-values.yaml: |
+    opencost:
+      exporter:
+        cloudProviderApiKey: ""    # AWS uses IRSA — no key needed
+        defaultClusterID: "autonomous-observability"
+        aws:
+          region: us-east-1
+
+      # Prometheus integration — OpenCost reads from and writes to Prometheus
+      prometheus:
+        internal:
+          enabled: true
+          serviceName: kube-prometheus-stack-prometheus
+          namespaceName: observability
+          port: 9090
+
+      # Cost model configuration
+      costModel:
+        # Use AWS on-demand pricing by default
+        # Spot instances are automatically detected and priced correctly
+        provider: aws
+
+        # Network cost tracking
+        networkCosts:
+          enabled: true
+          podLevelNetworkMetrics: true
+
+        # Storage cost tracking (EBS volumes)
+        storageCosts:
+          enabled: true
+
+      ui:
+        enabled: true
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "55Mi"
+
+    metrics:
+      serviceMonitor:
+        enabled: true
+        additionalLabels:
+          prometheus: kube-prometheus
+
+---
+# ── IRSA role for OpenCost (read AWS pricing) ─────────────────────────────────
+# OpenCost needs to call AWS Pricing API — no credentials, just IRSA
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opencost
+  namespace: cost
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/opencost-pricing-role"
+
+---
+# ── Recording rules: cost-per-request ────────────────────────────────────────
+# This is the key metric: how much does it cost to serve 1000 requests?
+# Computed as: (pod cost per second) / (requests per second) * 1000
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cost-recording-rules
+  namespace: cost
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+
+    - name: cost.per-request
+      interval: 60s
+      rules:
+
+        # Cost per 1000 requests — order service
+        - record: cost:order_service_per_1k_requests:dollars
+          expr: |
+            (
+              sum(container_cost_per_hour_dollars{namespace="app", pod=~"order-service.*"})
+              / 3600    # Convert hourly to per-second
+            )
+            /
+            sum(rate(order_service_requests_total[5m]))
+            * 1000      # Per 1000 requests
+
+        # Cost per 1000 requests — payment service
+        - record: cost:payment_service_per_1k_requests:dollars
+          expr: |
+            (
+              sum(container_cost_per_hour_dollars{namespace="app", pod=~"payment-service.*"})
+              / 3600
+            )
+            /
+            sum(rate(payment_service_requests_total[5m]))
+            * 1000
+
+        # Cost per SLO point — how much do we spend to maintain 99.9% availability?
+        - record: cost:order_service_per_slo_point:dollars_per_month
+          expr: |
+            sum(container_cost_per_hour_dollars{namespace="app", pod=~"order-service.*"})
+            * 730    # Hours per month
+
+        # CPU waste — provisioned but unused CPU (cost opportunity)
+        - record: cost:cpu_waste:cores
+          expr: |
+            sum by (namespace, pod) (
+              kube_pod_container_resource_requests{resource="cpu", namespace="app"}
+              -
+              avg_over_time(
+                container_cpu_usage_seconds_total{namespace="app"}[1h]
+              )
+            )
+
+        # Memory waste — provisioned but unused memory
+        - record: cost:memory_waste:bytes
+          expr: |
+            sum by (namespace, pod) (
+              kube_pod_container_resource_requests{resource="memory", namespace="app"}
+              -
+              avg_over_time(
+                container_memory_working_set_bytes{namespace="app"}[1h]
+              )
+            )
+
+        # Total cluster cost (all namespaces)
+        - record: cost:cluster_total_per_hour:dollars
+          expr: |
+            sum(container_cost_per_hour_dollars)
+
+        # Cost by namespace
+        - record: cost:namespace_per_hour:dollars
+          expr: |
+            sum by (namespace) (container_cost_per_hour_dollars)
+
+        # Cost by team label
+        - record: cost:team_per_day:dollars
+          expr: |
+            sum by (label_team) (
+              container_cost_per_hour_dollars
+              * on (pod, namespace) group_left(label_team)
+              kube_pod_labels{namespace="app"}
+            ) * 24
+
+        # Efficiency ratio: actual usage / requested resources
+        # 1.0 = perfect utilisation, 0.3 = 70% waste
+        - record: cost:cpu_efficiency_ratio
+          expr: |
+            sum(container_cpu_usage_seconds_total{namespace="app"})
+            /
+            sum(kube_pod_container_resource_requests{resource="cpu", namespace="app"})
+
+        - record: cost:memory_efficiency_ratio
+          expr: |
+            sum(container_memory_working_set_bytes{namespace="app"})
+            /
+            sum(kube_pod_container_resource_requests{resource="memory", namespace="app"})
+
+        # 30-day cost forecast (linear extrapolation from last 7 days)
+        - record: cost:cluster_forecast_30d:dollars
+          expr: |
+            predict_linear(
+              cost:cluster_total_per_hour:dollars[7d],
+              30 * 24 * 3600
+            ) * 730
