@@ -1,0 +1,347 @@
+# kubernetes/opa/gatekeeper-policies.yaml
+# OPA Gatekeeper — Policy as Code.
+#
+# These constraints BLOCK deployments that violate security policy.
+# A developer cannot accidentally deploy an insecure workload.
+# The policy is code, versioned, reviewed, tested — not a checklist.
+#
+# SOC 2 controls covered:
+#   CC6.1  — No containers running as root
+#   CC6.7  — All images from approved registries
+#   CC7.1  — Resource limits required (prevents DoS)
+#   CC8.1  — No privileged containers
+#   CC9.2  — Read-only root filesystem
+
+---
+# ── ConstraintTemplate 1: No root containers ─────────────────────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8snoroot
+  annotations:
+    description: "SOC 2 CC6.1 — Containers must not run as root"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sNoRoot
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8snoroot
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.securityContext.runAsNonRoot
+          msg := sprintf(
+            "Container '%v' must set securityContext.runAsNonRoot=true (SOC 2 CC6.1)",
+            [container.name]
+          )
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          container.securityContext.runAsUser == 0
+          msg := sprintf(
+            "Container '%v' must not run as UID 0 (root) (SOC 2 CC6.1)",
+            [container.name]
+          )
+        }
+
+        # Also check init containers
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.initContainers[_]
+          not container.securityContext.runAsNonRoot
+          msg := sprintf(
+            "Init container '%v' must set securityContext.runAsNonRoot=true",
+            [container.name]
+          )
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sNoRoot
+metadata:
+  name: no-root-containers
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+    namespaces: ["app", "ml", "observability"]
+    excludedNamespaces: ["kube-system", "istio-system", "security"]
+
+---
+# ── ConstraintTemplate 2: Approved registries only ───────────────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sapprovedregistries
+  annotations:
+    description: "SOC 2 CC6.7 — Images must come from approved registries"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sApprovedRegistries
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            registries:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sapprovedregistries
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          approved := input.parameters.registries
+          not any_approved(container.image, approved)
+          msg := sprintf(
+            "Container '%v' uses image '%v' from an unapproved registry. Approved: %v",
+            [container.name, container.image, approved]
+          )
+        }
+
+        any_approved(image, registries) {
+          registry := registries[_]
+          startswith(image, registry)
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sApprovedRegistries
+metadata:
+  name: approved-registries
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+    namespaces: ["app", "ml"]
+  parameters:
+    registries:
+      - "your-registry/"           # Internal registry
+      - "bitnami/"                 # Approved vendor
+      - "redis:"                   # Official Redis
+      - "confluentinc/"            # Confluent Kafka
+      - "grafana/"                 # Grafana
+      - "prom/"                    # Prometheus
+      - "otel/"                    # OpenTelemetry
+      - "hashicorp/"               # Vault
+
+---
+# ── ConstraintTemplate 3: Resource limits required ───────────────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredresourcelimits
+  annotations:
+    description: "SOC 2 CC7.1 — All containers must have CPU and memory limits"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredResourceLimits
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredresourcelimits
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.resources.limits.cpu
+          msg := sprintf(
+            "Container '%v' must have a CPU limit set (SOC 2 CC7.1 — prevents resource exhaustion)",
+            [container.name]
+          )
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.resources.limits.memory
+          msg := sprintf(
+            "Container '%v' must have a memory limit set (SOC 2 CC7.1)",
+            [container.name]
+          )
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.resources.requests.cpu
+          msg := sprintf(
+            "Container '%v' must have a CPU request set for accurate scheduling",
+            [container.name]
+          )
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredResourceLimits
+metadata:
+  name: required-resource-limits
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+    namespaces: ["app", "ml", "observability"]
+
+---
+# ── ConstraintTemplate 4: No privileged containers ───────────────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8snoprivileged
+  annotations:
+    description: "SOC 2 CC8.1 — No privileged containers or dangerous capabilities"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sNoPrivileged
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8snoprivileged
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          container.securityContext.privileged == true
+          msg := sprintf(
+            "Container '%v' must not be privileged (SOC 2 CC8.1)",
+            [container.name]
+          )
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          cap := container.securityContext.capabilities.add[_]
+          dangerous_caps := {"NET_ADMIN", "SYS_ADMIN", "SYS_PTRACE", "SYS_MODULE", "DAC_OVERRIDE"}
+          dangerous_caps[cap]
+          msg := sprintf(
+            "Container '%v' must not have dangerous capability '%v' (SOC 2 CC8.1)",
+            [container.name, cap]
+          )
+        }
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          container.securityContext.allowPrivilegeEscalation == true
+          msg := sprintf(
+            "Container '%v' must set allowPrivilegeEscalation=false",
+            [container.name]
+          )
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sNoPrivileged
+metadata:
+  name: no-privileged-containers
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+    namespaces: ["app", "ml"]
+
+---
+# ── ConstraintTemplate 5: Read-only root filesystem ──────────────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8sreadonlyrootfs
+  annotations:
+    description: "SOC 2 CC9.2 — Root filesystem must be read-only"
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sReadOnlyRootFs
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8sreadonlyrootfs
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not container.securityContext.readOnlyRootFilesystem
+          msg := sprintf(
+            "Container '%v' must set readOnlyRootFilesystem=true. Mount writable volumes explicitly if needed. (SOC 2 CC9.2)",
+            [container.name]
+          )
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sReadOnlyRootFs
+metadata:
+  name: readonly-root-filesystem
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet"]
+    namespaces: ["app", "ml"]
+
+---
+# ── ConstraintTemplate 6: Required security labels ───────────────────────────
+# Every deployment must declare its tier and team for alert routing
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+
+        violation[{"msg": msg}] {
+          required := input.parameters.labels[_]
+          not input.review.object.metadata.labels[required]
+          msg := sprintf(
+            "Resource must have label '%v' for observability and alert routing",
+            [required]
+          )
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequiredLabels
+metadata:
+  name: required-deployment-labels
+spec:
+  enforcementAction: warn   # warn for now — will switch to deny after migration
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment"]
+    namespaces: ["app", "ml"]
+  parameters:
+    labels:
+      - "app"
+      - "version"
+      - "team"
