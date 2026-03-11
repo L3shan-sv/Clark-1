@@ -1,0 +1,241 @@
+# kubernetes/cell-architecture/cell-router.yaml
+#
+# Cell Architecture — Blast Radius Containment at Scale
+#
+# A cell is a complete, independent stack serving a subset of customers.
+# Cells share physical infrastructure but are logically isolated.
+#
+# Customer routing:
+#   customer_id → hash → cell assignment → all requests for that customer
+#   go to the same cell for the lifetime of that customer's session.
+#
+# Why cells beat pure horizontal scaling:
+#   Pure horizontal:  1 bad deploy → 100% customers affected
+#   Cell architecture: 1 bad deploy → 1/N customers affected (N = cell count)
+#   Canary deploys naturally: deploy to cell-0, verify, roll to cell-1, cell-2
+#   Noisy neighbour isolation: one customer's traffic spike can't swamp others
+#
+# Failure domains:
+#   Cell failure → 33% of regional traffic (1/3 cells per region)
+#   Region failure → 40% of global traffic (routed to other regions)
+#   Worst case: 1 cell in 1 region → ~13% of traffic affected
+#   vs. non-cell architecture: 1 region failure = 40% traffic affected
+
+---
+# ── Cell Router — Envoy-based request routing ─────────────────────────────────
+# Runs as an Istio EnvoyFilter that intercepts all inbound requests
+# and routes to the correct cell based on customer_id header.
+
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: cell-router
+  namespace: istio-system
+spec:
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.lua
+          typed_config:
+            "@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.LuaPerRoute"
+            inline_code: |
+              -- Cell routing logic (Lua, runs in Envoy)
+              -- Determines which cell handles each request based on customer_id
+              -- Falls back to round-robin if no customer_id present
+
+              local CELLS = {"cell-0", "cell-1", "cell-2"}
+              local NUM_CELLS = #CELLS
+
+              function envoy_on_request(request_handle)
+                local customer_id = request_handle:headers():get("x-customer-id")
+
+                local cell
+                if customer_id then
+                  -- Consistent hashing: same customer → same cell every time
+                  -- Uses djb2 hash for speed and good distribution
+                  local hash = 5381
+                  for i = 1, #customer_id do
+                    hash = ((hash * 33) + string.byte(customer_id, i)) % 2147483647
+                  end
+                  local cell_idx = (hash % NUM_CELLS) + 1
+                  cell = CELLS[cell_idx]
+                else
+                  -- No customer_id (unauthenticated) → cell-0 (default cell)
+                  cell = CELLS[1]
+                end
+
+                -- Inject cell header — downstream services use this for observability
+                request_handle:headers():add("x-cell", cell)
+                request_handle:headers():add("x-region", os.getenv("AWS_REGION") or "unknown")
+
+                -- Route to the correct cell's namespace
+                -- Istio VirtualService uses this header for routing
+                request_handle:headers():add("x-routing-cell", cell)
+              end
+
+---
+# ── VirtualService: route by cell header ──────────────────────────────────────
+# Routes requests to the correct cell's services based on x-routing-cell header
+
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: order-service-cell-routing
+  namespace: istio-system
+spec:
+  hosts:
+    - order-service.app.svc.cluster.local
+  http:
+    - match:
+        - headers:
+            x-routing-cell:
+              exact: cell-0
+      route:
+        - destination:
+            host: order-service.cell-0.svc.cluster.local
+            port:
+              number: 8000
+
+    - match:
+        - headers:
+            x-routing-cell:
+              exact: cell-1
+      route:
+        - destination:
+            host: order-service.cell-1.svc.cluster.local
+            port:
+              number: 8000
+
+    - match:
+        - headers:
+            x-routing-cell:
+              exact: cell-2
+      route:
+        - destination:
+            host: order-service.cell-2.svc.cluster.local
+            port:
+              number: 8000
+
+    # Default: route to cell-0 if no header
+    - route:
+        - destination:
+            host: order-service.cell-0.svc.cluster.local
+            port:
+              number: 8000
+
+---
+# ── Cell Deployment Template (applied to each cell namespace) ─────────────────
+# Each cell runs its own copy of all app services
+# This manifest is applied with `namespace: cell-0`, `cell-1`, `cell-2`
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: cell-0      # Duplicate for cell-1, cell-2
+  labels:
+    app: order-service
+    cell: cell-0
+    version: v1
+    team: platform
+spec:
+  replicas: 2            # 2 replicas per cell (HPA scales up from here)
+  selector:
+    matchLabels:
+      app: order-service
+      cell: cell-0
+  template:
+    metadata:
+      labels:
+        app: order-service
+        cell: cell-0
+        version: v1
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: order-service
+              cell: cell-0
+      containers:
+        - name: order-service
+          image: your-registry/order-service:latest
+          env:
+            - name: CELL_ID
+              value: "cell-0"
+            - name: REGION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['topology.kubernetes.io/region']
+          # All other env vars injected by Vault (Phase 6)
+
+---
+# ── Cell Health Monitor ────────────────────────────────────────────────────────
+# Tracks per-cell error rates. Enables surgical cell evacuation:
+# if cell-1 degrades, drain it and send traffic to cell-0 and cell-2.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cell-health-rules
+  namespace: observability
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: cell.health
+      rules:
+
+        # Per-cell error rate
+        - record: cell:error_rate:ratio
+          expr: |
+            sum by (cell, region) (
+              rate(order_service_requests_total{status_code=~"5.."}[5m])
+            )
+            /
+            sum by (cell, region) (
+              rate(order_service_requests_total[5m])
+            )
+
+        # Per-cell request rate (for load balancing decisions)
+        - record: cell:request_rate:rps
+          expr: |
+            sum by (cell, region) (
+              rate(order_service_requests_total[1m])
+            )
+
+        # Cell degraded — error rate > 1% for > 2 minutes
+        - alert: CellDegraded
+          expr: cell:error_rate:ratio > 0.01
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Cell {{ $labels.cell }} in {{ $labels.region }} degraded"
+            description: |
+              Cell {{ $labels.cell }} error rate is {{ $value | humanizePercentage }}.
+              Consider draining this cell. Only {{ 1 | sub }} other cells will absorb traffic.
+            runbook: "kubectl patch virtualservice order-service-cell-routing -p '{...}' to drain cell"
+
+        # Cell completely down — no traffic flowing for > 1 minute
+        - alert: CellDown
+          expr: cell:request_rate:rps == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Cell {{ $labels.cell }} in {{ $labels.region }} is receiving no traffic"
+            description: "Cell may be completely down or routing is broken."
