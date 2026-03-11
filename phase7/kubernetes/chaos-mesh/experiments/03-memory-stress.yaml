@@ -1,0 +1,170 @@
+# kubernetes/chaos-mesh/experiments/03-memory-stress.yaml
+#
+# Experiment 3: Memory Stress — Pod OOM + Redis Pressure
+#
+# Hypothesis:
+#   When order-service pods consume 90% of their memory limit:
+#     1. Kubernetes throttles then OOMKills the pod
+#     2. Falco OOMKill alert fires
+#     3. Pod restarts — new pod stays within memory limits
+#     4. If Redis simultaneously hits 85% memory:
+#        → Redis auto-remediation workflow triggers (Phase 4)
+#        → Eviction policy switches to allkeys-lru
+#        → Slack notification posted
+#     5. Combined memory pressure does NOT cascade to full outage
+#
+# What this tests:
+#   - Memory limit accuracy (are our limits set correctly?)
+#   - Redis remediation workflow (Phase 4) end-to-end
+#   - Does OOMKill of order-service affect in-flight payment requests?
+#   - HPA: does it scale out BEFORE OOMKill, or only after?
+
+---
+# ── 3a: Memory stress on order-service ───────────────────────────────────────
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: exp03a-order-service-memory-stress
+  namespace: chaos
+  annotations:
+    experiment.chaos/hypothesis: "OOMKill triggers within 2 min. Falco fires. Pod restarts cleanly."
+    experiment.chaos/blast-radius: "1 order-service pod"
+spec:
+  mode: one
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: order-service
+  stressors:
+    memory:
+      workers: 2
+      size: "1500MiB"    # order-service limit is 2Gi — this pushes it to 75%
+      options:
+        - "--vm-keep"    # Hold memory, don't release
+  duration: "4m"
+
+---
+# ── 3b: Aggressive memory stress (triggers OOMKill) ──────────────────────────
+# Run after 3a if you want to actually trigger OOMKill
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: exp03b-order-service-oomkill
+  namespace: chaos
+  annotations:
+    experiment.chaos/hypothesis: "OOMKill within 60s. Falco fires within 10s of kill. Pod back in 30s."
+spec:
+  mode: one
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: order-service
+  stressors:
+    memory:
+      workers: 4
+      size: "4GiB"    # Way over the 2Gi limit — guaranteed OOMKill
+  duration: "2m"
+
+---
+# ── 3c: CPU stress — tests HPA responsiveness ────────────────────────────────
+# Hypothesis: HPA scales out within 90 seconds of CPU > 70%.
+# If HPA is too slow, request latency will climb.
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: exp03c-cpu-stress-hpa
+  namespace: chaos
+  annotations:
+    experiment.chaos/hypothesis: "HPA scales from 3→5 pods within 90s. Latency stays < 200ms p95."
+spec:
+  mode: all    # Stress ALL order-service pods simultaneously → forces HPA
+  selector:
+    namespaces:
+      - app
+    labelSelectors:
+      app: order-service
+  stressors:
+    cpu:
+      workers: 4       # Saturate CPUs
+      load: 80         # 80% CPU load
+  duration: "5m"
+
+---
+# ── HPA for order-service ─────────────────────────────────────────────────────
+# Define here so CPU stress experiment has an HPA to test against
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service
+  namespace: app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60    # Scale when avg CPU > 60%
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70    # Also scale on memory pressure
+    # Custom metric from Prometheus — scale on request rate
+    - type: Pods
+      pods:
+        metric:
+          name: order_service_active_requests
+        target:
+          type: AverageValue
+          averageValue: "30"        # Scale if avg active requests > 30/pod
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30    # Scale UP fast
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300   # Scale DOWN slowly (5 min)
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payment-service
+  namespace: app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: payment-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 600   # Payment service scales down even more slowly
