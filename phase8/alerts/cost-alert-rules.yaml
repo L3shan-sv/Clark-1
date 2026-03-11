@@ -1,0 +1,211 @@
+# alerts/cost-alert-rules.yaml
+#
+# Cost Observability Alerts
+#
+# Three categories:
+#   1. Budget alerts  — actual spend vs forecast vs budget
+#   2. Waste alerts   — overprovisioned resources burning money
+#   3. Efficiency     — cost-per-request anomalies (sudden cost spike)
+#
+# Philosophy: cost alerts should fire BEFORE the bill arrives.
+# A weekly "you spent $12k this week vs $8k last week" is too late.
+# These alerts fire in real time so engineers can act same-day.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cost-alert-rules
+  namespace: cost
+  labels:
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+
+    # ── Budget Alerts ─────────────────────────────────────────────────────────
+    - name: cost.budget
+      rules:
+
+        - alert: ClusterSpendForecastExceedsBudget
+          expr: |
+            cost:cluster_forecast_30d:dollars > 15000
+          for: 30m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "💸 30-day cluster cost forecast exceeds $15k budget"
+            description: |
+              Forecasted 30-day cluster spend is ${{ $value | humanize }}.
+              This exceeds the monthly budget of $15,000.
+              Review recent resource changes and scaling events.
+              Top namespace by spend: check the Cost Observability dashboard.
+
+        - alert: HourlySpendSpike
+          expr: |
+            cost:cluster_total_per_hour:dollars
+            > 1.5 * avg_over_time(cost:cluster_total_per_hour:dollars[24h])
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "💸 Cluster hourly spend is 50% above 24h average"
+            description: |
+              Current hourly spend: ${{ $value | humanize }}.
+              This is 50%+ above the 24-hour average.
+              Likely causes: HPA scale-out event, new deployment, traffic spike.
+              Check: kubectl top nodes && kubectl get hpa -A
+
+        - alert: NamespaceSpendAnomaly
+          expr: |
+            cost:namespace_per_hour:dollars
+            > 2 * avg_over_time(cost:namespace_per_hour:dollars[7d])
+          for: 30m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "💸 Namespace {{ $labels.namespace }} spend is 2× above 7-day average"
+            description: |
+              Namespace {{ $labels.namespace }} is spending ${{ $value | humanize }}/hr.
+              This is more than double its 7-day average.
+              Investigate recent deployments or HPA events in this namespace.
+
+    # ── Waste Alerts ──────────────────────────────────────────────────────────
+    - name: cost.waste
+      rules:
+
+        - alert: CPUEfficiencyLow
+          expr: |
+            cost:cpu_efficiency_ratio < 0.30
+          for: 2h
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "💸 CPU efficiency below 30% — significant waste detected"
+            description: |
+              Cluster CPU efficiency is {{ $value | humanizePercentage }}.
+              Pods are requesting {{ div 1 $value | humanize }}× more CPU than they use.
+              Run the rightsizing engine to generate reduction recommendations.
+              Estimated waste: ${{ mul (sub 1 $value) (mul cost:cluster_total_per_hour:dollars 730) | humanize }}/month.
+
+        - alert: MemoryEfficiencyLow
+          expr: |
+            cost:memory_efficiency_ratio < 0.35
+          for: 2h
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "💸 Memory efficiency below 35% — overprovisioned"
+            description: |
+              Cluster memory efficiency is {{ $value | humanizePercentage }}.
+              Review memory requests via the Cost Observability dashboard.
+
+        - alert: LargeUnusedPVCDetected
+          expr: |
+            (kubelet_volume_stats_capacity_bytes - kubelet_volume_stats_used_bytes)
+            / kubelet_volume_stats_capacity_bytes > 0.80
+            and kubelet_volume_stats_capacity_bytes > 10 * 1024 * 1024 * 1024
+          for: 24h
+          labels:
+            severity: info
+            team: platform
+          annotations:
+            summary: "💸 PVC {{ $labels.persistentvolumeclaim }} is > 80% empty (> 10Gi)"
+            description: |
+              PVC {{ $labels.persistentvolumeclaim }} in {{ $labels.namespace }} is
+              {{ $value | humanizePercentage }} unused and larger than 10Gi.
+              Consider reducing the PVC size or deleting if no longer needed.
+              EBS volumes bill for provisioned size, not used size.
+
+        - alert: IdleNodeGroupDetected
+          expr: |
+            sum by (node_group) (
+              kube_node_labels{label_role="app"}
+            )
+            > 0
+            and
+            sum by (node_group) (
+              kube_pod_info{namespace="app"}
+            ) / sum by (node_group) (
+              kube_node_labels{label_role="app"}
+            ) < 2
+          for: 4h
+          labels:
+            severity: info
+            team: platform
+          annotations:
+            summary: "💸 Node group has < 2 app pods per node — possibly over-scaled"
+            description: |
+              The app node group has fewer than 2 pods per node for the last 4 hours.
+              This may indicate scale-down hasn't run or minimum replicas is too high.
+              Check cluster autoscaler scale-down logs.
+
+    # ── Cost-per-Request Anomalies ────────────────────────────────────────────
+    - name: cost.per-request
+      rules:
+
+        - alert: CostPerRequestSpike
+          expr: |
+            cost:order_service_per_1k_requests:dollars
+            > 2 * avg_over_time(cost:order_service_per_1k_requests:dollars[7d])
+          for: 30m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "💸 Cost per 1k order-service requests doubled vs 7-day average"
+            description: |
+              Cost per 1,000 order-service requests: ${{ $value | humanize }}.
+              This is 2× the 7-day average — meaning either costs rose or RPS fell.
+              Check: (1) HPA over-scaled, (2) traffic drop (revenue impact?),
+              (3) a recent deployment changed resource usage.
+
+        - alert: MLServiceCostHigh
+          expr: |
+            cost:namespace_per_hour:dollars{namespace="ml"} > 5
+          for: 1h
+          labels:
+            severity: info
+            team: platform
+          annotations:
+            summary: "💸 ML namespace spending > $5/hr"
+            description: |
+              ML services are spending ${{ $value | humanize }}/hr.
+              ML training jobs (Prophet, LSTM retraining) are the likely driver.
+              Confirm this is expected — if no retraining should be happening, investigate.
+
+    # ── Rightsizing ───────────────────────────────────────────────────────────
+    - name: cost.rightsizing
+      rules:
+
+        - alert: RightsizingSavingsAvailable
+          expr: |
+            sum(rightsizing_estimated_monthly_savings_dollars) > 200
+          for: 0m   # Fire immediately — weekly digest isn't enough for large savings
+          labels:
+            severity: info
+            team: platform
+          annotations:
+            summary: "💸 Rightsizing engine found ${{ $value | humanize }}/mo in savings"
+            description: |
+              The rightsizing engine has identified ${{ $value | humanize }}/month
+              in potential savings from overprovisioned containers.
+              Review recommendations: kubectl logs -n ml deployment/rightsizing-engine
+              Apply patches: kubectl apply -f /tmp/rightsizing-patch.sh (after review)
+
+        - alert: RightsizingEngineDown
+          expr: |
+            absent(rightsizing_estimated_monthly_savings_dollars)
+          for: 25h   # Should run weekly — alert if missing for > 25h
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "⚠️ Rightsizing engine has not produced metrics in 25 hours"
+            description: |
+              The rightsizing engine may be down or stuck.
+              Check: kubectl logs -n ml deployment/rightsizing-engine
