@@ -1,0 +1,141 @@
+# kubernetes/chaos-mesh/experiments/04-node-failure.yaml
+#
+# Experiment 4: Node Failure — Zone Isolation
+#
+# Hypothesis:
+#   When one EKS node is made unavailable (simulated via cordon + process kill):
+#     1. Pods on that node enter Terminating state within 30s
+#     2. Pods reschedule to healthy nodes within 60s (topology spread constraint)
+#     3. PodDisruptionBudgets prevent simultaneous loss of all replicas
+#     4. NodeAvailabilityDegraded alert fires within 5 minutes
+#     5. Argo node cordon/drain workflow triggers (Phase 4)
+#     6. Cluster autoscaler provisions replacement node within 5 minutes
+#     7. SLO budget impact: < 1 minute of degraded availability
+#
+# Multi-AZ resilience: topology spread constraints ensure pods are spread
+# across 3 AZs. Losing one node (in one AZ) should not cause outage.
+#
+# What this proves:
+#   - Topology spread constraints are actually working
+#   - PodDisruptionBudgets prevent mass eviction
+#   - Cluster Autoscaler provisions nodes fast enough
+#   - Pod scheduling respects node affinity rules after reschedule
+
+---
+# ── 4a: Cordon a node (soft failure) ─────────────────────────────────────────
+# Simulates a node being marked unschedulable (e.g. pre-maintenance)
+# All running pods continue, but no new pods can be scheduled.
+# Tests: do existing pods stay healthy? Does HPA work with fewer schedulable nodes?
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PhysicalMachineChaos
+metadata:
+  name: exp04a-node-cordon
+  namespace: chaos
+  annotations:
+    experiment.chaos/hypothesis: "Cordon doesn't affect running pods. HPA uses remaining nodes."
+    experiment.chaos/manual-step: "kubectl cordon <node-name>  # Run manually — safer than automated"
+    experiment.chaos/undo: "kubectl uncordon <node-name>"
+spec:
+  action: process
+  address: "192.168.1.10:31767"    # Replace with actual node IP + ChaosDaemon port
+  process:
+    process: "kubelet"
+    signal: 19     # SIGSTOP — pauses kubelet (simulates unresponsive node)
+    recoverCmd: "kill -CONT $(pgrep kubelet)"
+  duration: "3m"
+
+---
+# ── 4b: Network isolation of entire node ─────────────────────────────────────
+# More realistic than killing kubelet — simulates AZ network failure.
+# Node stays "running" but can't communicate.
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: exp04b-node-network-isolation
+  namespace: chaos
+  annotations:
+    experiment.chaos/hypothesis: "Node NotReady within 40s. Pods evicted. Rescheduled within 90s."
+    experiment.chaos/blast-radius: "One node (1/9 nodes in cluster — 3 per AZ)"
+spec:
+  action: partition
+  mode: one          # Only ONE node
+  selector:
+    namespaces:
+      - app
+    nodeSelectors:
+      "topology.kubernetes.io/zone": "us-east-1a"    # Partition one AZ's node
+  direction: both    # Isolate completely
+  duration: "5m"
+
+---
+# ── Topology Spread Constraints (add to all Deployments) ──────────────────────
+# This is what guarantees pods spread across AZs.
+# Without this, all pods could land on one node — single point of failure.
+
+# Merge into order-service Deployment spec.template.spec:
+# topologySpreadConstraints:
+#   - maxSkew: 1
+#     topologyKey: topology.kubernetes.io/zone
+#     whenUnsatisfiable: DoNotSchedule
+#     labelSelector:
+#       matchLabels:
+#         app: order-service
+#   - maxSkew: 1
+#     topologyKey: kubernetes.io/hostname
+#     whenUnsatisfiable: DoNotSchedule
+#     labelSelector:
+#       matchLabels:
+#         app: order-service
+
+---
+# ── Cluster Autoscaler configuration ──────────────────────────────────────────
+# Provisions new nodes fast enough for the chaos experiment to "pass"
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-autoscaler-config
+  namespace: kube-system
+data:
+  # Key tuning parameters for fast node provisioning
+  config.yaml: |
+    scale-down-enabled: true
+    scale-down-delay-after-add: 5m
+    scale-down-unneeded-time: 10m
+    scale-down-utilization-threshold: 0.5
+    max-node-provision-time: 5m      # Fail if node not ready in 5 min
+    scan-interval: 10s               # Check every 10s (default is 10s)
+    skip-nodes-with-local-storage: false
+    expander: least-waste
+
+---
+# ── Verification queries to run DURING experiment ────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: exp04-verification-queries
+  namespace: chaos
+data:
+  queries.md: |
+    # Run these in Prometheus during Experiment 4
+
+    # 1. Node availability (should drop to ~0.88 with 8/9 nodes healthy)
+    sum(kube_node_status_condition{condition="Ready",status="true"}) / count(kube_node_info)
+
+    # 2. Pod scheduling across AZs (should stay balanced)
+    count by (topology_kubernetes_io_zone) (
+      kube_pod_info{namespace="app"}
+    )
+
+    # 3. Pending pods (should be 0 within 60s of node failure)
+    count(kube_pod_status_phase{namespace="app",phase="Pending"})
+
+    # 4. Error rate during reschedule (should stay < 0.1%)
+    sum(rate(order_service_requests_total{status_code=~"5.."}[1m]))
+    /
+    sum(rate(order_service_requests_total[1m]))
+
+    # 5. Time to reschedule (watch this number drop to 0)
+    count(kube_pod_status_phase{namespace="app",phase="Pending"})
