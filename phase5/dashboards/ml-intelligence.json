@@ -1,0 +1,231 @@
+{
+  "uid": "ml-intelligence",
+  "title": "ML Intelligence Layer",
+  "description": "Forecasts, anomalies, causal analysis, RL agent policy, drift detection. The brain dashboard.",
+  "tags": ["ml", "ai", "intelligence"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+
+    {
+      "id": 1,
+      "title": "Predicted vs Actual RPS — Order Service",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 7 },
+      "description": "Prophet forecast (upper band) vs actual. Green band = forecast uncertainty. Scaling targets the upper bound.",
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Predicted (upper)" }, "properties": [{ "id": "custom.fillOpacity", "value": 20 }] },
+          { "matcher": { "id": "byName", "options": "Actual" }, "properties": [{ "id": "custom.lineWidth", "value": 2 }] }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "ml_forecast_predicted_rps{service='order-service'}",
+          "legendFormat": "Predicted (mean)"
+        },
+        {
+          "expr": "ml_forecast_upper_rps{service='order-service'}",
+          "legendFormat": "Predicted (upper)"
+        },
+        {
+          "expr": "sum(rate(order_service_requests_total[1m]))",
+          "legendFormat": "Actual"
+        }
+      ]
+    },
+
+    {
+      "id": 2,
+      "title": "Forecast MAPE per Service",
+      "type": "bargauge",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 7 },
+      "description": "Mean Absolute Percentage Error. < 15% is good. > 30% means model needs retraining.",
+      "options": { "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 15 },
+              { "color": "red", "value": 30 }
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "expr": "ml_forecast_mape_percent",
+        "legendFormat": "{{ service }}"
+      }]
+    },
+
+    {
+      "id": 3,
+      "title": "Recommended Scale (Replicas)",
+      "type": "stat",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 7 },
+      "description": "What the forecaster recommends scaling to in the next 30 minutes.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 8 },
+              { "color": "red", "value": 15 }
+            ]
+          },
+          "unit": "short",
+          "displayName": "{{ service }}"
+        }
+      },
+      "targets": [{
+        "expr": "ceil(ml_forecast_upper_rps / 50)",
+        "legendFormat": "{{ service }}"
+      }]
+    },
+
+    {
+      "id": 4,
+      "title": "Ensemble Anomaly Confidence",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 7, "w": 12, "h": 6 },
+      "description": "Combined confidence score from all three detectors. Dashed line = alert threshold (0.75).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.6 },
+              { "color": "red", "value": 0.75 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "dashed" } }
+        }
+      },
+      "targets": [
+        {
+          "expr": "ml_ensemble_confidence{service='order-service'}",
+          "legendFormat": "{{ metric }}"
+        }
+      ]
+    },
+
+    {
+      "id": 5,
+      "title": "Individual Detector Scores",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 7, "w": 12, "h": 6 },
+      "description": "IsolationForest vs LSTM vs CUSUM. Seeing which detectors agree shows signal vs noise.",
+      "targets": [
+        {
+          "expr": "ml_detector_score{detector='isolation_forest', service='order-service'}",
+          "legendFormat": "IsolationForest"
+        },
+        {
+          "expr": "ml_detector_score{detector='lstm', service='order-service'}",
+          "legendFormat": "LSTM Autoencoder"
+        },
+        {
+          "expr": "ml_detector_score{detector='cusum', service='order-service'}",
+          "legendFormat": "CUSUM"
+        }
+      ]
+    },
+
+    {
+      "id": 6,
+      "title": "RL Agent — Action Success Rates",
+      "type": "table",
+      "gridPos": { "x": 0, "y": 13, "w": 14, "h": 6 },
+      "description": "Thompson Sampling policy — each row is a learned (incident_class, action) pair. Higher success rate = action chosen more often.",
+      "targets": [
+        {
+          "expr": "rate(rl_agent_action_successes_total[7d]) / (rate(rl_agent_action_successes_total[7d]) + rate(rl_agent_action_failures_total[7d]))",
+          "legendFormat": "{{ incident_class }} / {{ action }}",
+          "instant": true
+        }
+      ]
+    },
+
+    {
+      "id": 7,
+      "title": "RL Agent Mode",
+      "type": "stat",
+      "gridPos": { "x": 14, "y": 13, "w": 5, "h": 3 },
+      "description": "Shadow = recommends only. Auto = executes remediation.",
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "AUTO", "color": "green" } } },
+            { "type": "value", "options": { "1": { "text": "SHADOW", "color": "yellow" } } }
+          ]
+        }
+      },
+      "targets": [{
+        "expr": "1",
+        "legendFormat": "Mode"
+      }]
+    },
+
+    {
+      "id": 8,
+      "title": "Model Drift PSI Scores",
+      "type": "bargauge",
+      "gridPos": { "x": 14, "y": 16, "w": 10, "h": 6 },
+      "description": "PSI < 0.1 = stable. 0.1-0.2 = monitor. > 0.2 = retrain immediately.",
+      "options": { "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.1 },
+              { "color": "red", "value": 0.2 }
+            ]
+          },
+          "unit": "short",
+          "max": 0.5
+        }
+      },
+      "targets": [{
+        "expr": "ml_drift_psi_score",
+        "legendFormat": "{{ model }} / {{ feature }}"
+      }]
+    },
+
+    {
+      "id": 9,
+      "title": "Anomalies Detected (24h)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 19, "w": 12, "h": 5 },
+      "targets": [{
+        "expr": "increase(ml_anomalies_detected_total[1h])",
+        "legendFormat": "{{ service }} / {{ detector }}"
+      }]
+    },
+
+    {
+      "id": 10,
+      "title": "Model Training Latency",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 19, "w": 12, "h": 5 },
+      "description": "How long each model takes to retrain. Spikes here mean the model is expensive to update.",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum by (le, service) (rate(ml_forecast_training_duration_seconds_bucket[1h])))",
+        "legendFormat": "{{ service }} p95"
+      }]
+    }
+
+  ]
+}
