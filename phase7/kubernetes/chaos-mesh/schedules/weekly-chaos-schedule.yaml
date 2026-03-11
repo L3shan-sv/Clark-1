@@ -1,0 +1,94 @@
+# kubernetes/chaos-mesh/schedules/weekly-chaos-schedule.yaml
+#
+# Scheduled Chaos — GameDay Automation
+#
+# Why scheduled?
+#   Manual chaos is great for learning. Scheduled chaos is how you
+#   MAINTAIN confidence. The system must survive every week,
+#   not just on the day you first test it.
+#
+# Schedule design:
+#   - Experiments run in staging only (not prod — yet)
+#   - Always run during business hours (observers present)
+#   - Each experiment is small — single failure type
+#   - Full cascade (Experiment 5) runs monthly, not weekly
+#   - Auto-paused if any SLO budget < 20%
+
+---
+# ── Weekly: Pod Kill — Tuesday 10am ──────────────────────────────────────────
+# The simplest test. If this fails, everything else will too.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: weekly-pod-kill
+  namespace: chaos
+spec:
+  schedule: "0 10 * * 2"    # Every Tuesday at 10:00 UTC
+  type: PodChaos
+  historyLimit: 5
+  concurrencyPolicy: Forbid  # Don't run if previous experiment still active
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      namespaces:
+        - app
+      labelSelectors:
+        app: order-service
+    scheduler:
+      cron: "@once"
+
+---
+# ── Weekly: Network Latency — Wednesday 10am ─────────────────────────────────
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: weekly-network-latency
+  namespace: chaos
+spec:
+  schedule: "0 10 * * 3"    # Every Wednesday at 10:00 UTC
+  type: NetworkChaos
+  historyLimit: 5
+  concurrencyPolicy: Forbid
+  networkChaos:
+    action: delay
+    mode: one
+    selector:
+      namespaces:
+        - app
+      labelSelectors:
+        app: payment-service
+    delay:
+      latency: "300ms"
+      jitter: "50ms"
+    duration: "5m"
+
+---
+# ── Monthly: Full Cascade — First Monday of month at 11am ────────────────────
+# The boss fight. Run monthly to keep confidence high.
+# Requires manual approval (Argo Workflow with suspend node).
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: monthly-cascade-failure
+  namespace: chaos
+  annotations:
+    note: "Requires manual approval before executing. See workflow exp05-cascade-failure-orchestrator."
+spec:
+  schedule: "0 11 1-7 * 1"    # First Monday of month at 11:00 UTC
+  type: Workflow
+  historyLimit: 3
+  concurrencyPolicy: Forbid
+  workflow:
+    templates:
+      - name: cascade-with-approval
+        steps:
+          - - name: wait-for-approval
+              template: suspend
+          - - name: run-cascade
+              templateRef:
+                name: exp05-cascade-failure-orchestrator
+                template: cascade
+
+      - name: suspend
+        suspend: {}    # Pauses here — engineer approves in Argo UI
