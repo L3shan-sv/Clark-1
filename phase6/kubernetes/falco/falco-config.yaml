@@ -1,0 +1,230 @@
+# kubernetes/falco/falco-config.yaml
+# Falco — runtime security via eBPF kernel instrumentation.
+#
+# Falco watches every syscall in every container via eBPF probes.
+# It evaluates them against rules in real time (microsecond latency).
+# When a rule matches → alert fires → Argo workflow can respond automatically.
+#
+# These rules are tuned for OUR workload:
+#   - FastAPI Python services (known-good process tree)
+#   - Known network destinations (Kafka, Redis, PostgreSQL, OTLP)
+#   - Known file access patterns
+#   - Alert on ANYTHING outside these patterns
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-rules
+  namespace: security
+data:
+  custom_rules.yaml: |
+
+    # ── Rule 1: Shell spawned in container ───────────────────────────────────
+    # Production containers NEVER need a shell.
+    # If one spawns, it's either an attacker or a developer who shouldn't be there.
+    - rule: Shell Spawned in App Container
+      desc: A shell was spawned in an app container. This should never happen in production.
+      condition: >
+        spawned_process
+        and container
+        and container.image.repository contains "your-registry"
+        and proc.name in (bash, sh, zsh, ksh, fish)
+        and not proc.pname in (runc, containerd-shim)
+      output: >
+        🚨 SHELL SPAWNED in container
+        (user=%user.name user_loginuid=%user.loginuid
+        pod=%k8s.pod.name ns=%k8s.ns.name
+        image=%container.image.repository:%container.image.tag
+        shell=%proc.name parent=%proc.pname
+        cmdline=%proc.cmdline)
+      priority: CRITICAL
+      tags: [container, shell, attack, T1059]
+
+    # ── Rule 2: Privilege escalation attempt ─────────────────────────────────
+    - rule: Privilege Escalation Attempt
+      desc: A process attempted to gain elevated privileges via setuid/setgid
+      condition: >
+        syscall.type in (setuid, setgid, seteuid, setegid)
+        and container
+        and not user.uid=0
+        and container.image.repository contains "your-registry"
+      output: >
+        🚨 PRIVILEGE ESCALATION ATTEMPT
+        (user=%user.name uid=%user.uid pod=%k8s.pod.name
+        ns=%k8s.ns.name image=%container.image
+        syscall=%syscall.type cmdline=%proc.cmdline)
+      priority: CRITICAL
+      tags: [container, privilege_escalation, T1548]
+
+    # ── Rule 3: Unexpected outbound connection ────────────────────────────────
+    # Our services only connect to: Kafka, Redis, PostgreSQL, OTLP, Vault, Prometheus
+    # Any other destination is suspicious.
+    - rule: Unexpected Outbound Connection
+      desc: Container made an outbound connection to an unexpected destination
+      condition: >
+        outbound
+        and container
+        and container.image.repository contains "your-registry"
+        and not (
+          fd.sip.name in (
+            "kafka.app.svc.cluster.local",
+            "redis.app.svc.cluster.local",
+            "postgresql.app.svc.cluster.local",
+            "otel-collector.observability.svc.cluster.local",
+            "vault.security.svc.cluster.local",
+            "kube-prometheus-stack-prometheus.observability.svc.cluster.local"
+          )
+          or fd.sport in (443, 4317, 4318, 9092, 6379, 5432, 8200)
+          or fd.sip = "127.0.0.1"
+        )
+      output: >
+        ⚠️ UNEXPECTED OUTBOUND CONNECTION
+        (pod=%k8s.pod.name ns=%k8s.ns.name
+        image=%container.image
+        dest=%fd.name dest_ip=%fd.sip dest_port=%fd.sport
+        cmdline=%proc.cmdline)
+      priority: WARNING
+      tags: [network, exfiltration, T1071]
+
+    # ── Rule 4: Sensitive file access ─────────────────────────────────────────
+    - rule: Sensitive File Access
+      desc: Container accessed a sensitive file it should not need
+      condition: >
+        open_read
+        and container
+        and container.image.repository contains "your-registry"
+        and (
+          fd.name startswith /etc/shadow
+          or fd.name startswith /etc/sudoers
+          or fd.name startswith /root/.ssh
+          or fd.name startswith /proc/sysrq-trigger
+          or fd.name startswith /etc/kubernetes
+        )
+      output: >
+        🚨 SENSITIVE FILE ACCESS
+        (user=%user.name pod=%k8s.pod.name
+        ns=%k8s.ns.name file=%fd.name
+        cmdline=%proc.cmdline)
+      priority: CRITICAL
+      tags: [filesystem, T1005]
+
+    # ── Rule 5: Container escape attempt ──────────────────────────────────────
+    - rule: Container Escape via Namespace
+      desc: Process attempted to enter host namespaces — classic container escape
+      condition: >
+        syscall.type = setns
+        and container
+        and not proc.name in (pause, runc)
+      output: >
+        🚨 CONTAINER ESCAPE ATTEMPT via setns
+        (user=%user.name pod=%k8s.pod.name
+        ns=%k8s.ns.name image=%container.image
+        cmdline=%proc.cmdline)
+      priority: CRITICAL
+      tags: [container, escape, T1611]
+
+    # ── Rule 6: Crypto mining detection ───────────────────────────────────────
+    - rule: Crypto Mining Binary Detected
+      desc: A known crypto miner binary or network connection pattern detected
+      condition: >
+        spawned_process
+        and container
+        and (
+          proc.name in (xmrig, minerd, cgminer, bfgminer, cpuminer, ethminer)
+          or proc.cmdline contains "--stratum"
+          or proc.cmdline contains "pool.supportxmr.com"
+        )
+      output: >
+        🚨 CRYPTO MINING DETECTED
+        (pod=%k8s.pod.name ns=%k8s.ns.name
+        image=%container.image proc=%proc.name
+        cmdline=%proc.cmdline)
+      priority: CRITICAL
+      tags: [cryptomining, T1496]
+
+    # ── Rule 7: Write to binary directory ─────────────────────────────────────
+    - rule: Write to Binary Directory
+      desc: Unexpected write to /bin, /sbin, /usr/bin — possible binary replacement
+      condition: >
+        open_write
+        and container
+        and container.image.repository contains "your-registry"
+        and (
+          fd.name startswith /bin/
+          or fd.name startswith /sbin/
+          or fd.name startswith /usr/bin/
+          or fd.name startswith /usr/sbin/
+        )
+      output: >
+        🚨 BINARY DIRECTORY WRITE
+        (user=%user.name pod=%k8s.pod.name
+        ns=%k8s.ns.name file=%fd.name
+        cmdline=%proc.cmdline)
+      priority: CRITICAL
+      tags: [filesystem, persistence, T1574]
+
+    # ── Rule 8: Kubernetes secret access ──────────────────────────────────────
+    # Most pods should not be reading K8s secrets via the API
+    # They should be getting secrets via Vault instead
+    - rule: Direct K8s Secret Access via API
+      desc: Pod accessed Kubernetes secrets API directly — should use Vault instead
+      condition: >
+        outbound
+        and container
+        and container.image.repository contains "your-registry"
+        and fd.sport = 443
+        and proc.cmdline contains "secrets"
+        and not k8s.pod.name startswith "vault"
+      output: >
+        ⚠️ DIRECT K8S SECRET API ACCESS
+        (pod=%k8s.pod.name ns=%k8s.ns.name
+        cmdline=%proc.cmdline)
+      priority: WARNING
+      tags: [credentials, T1552]
+
+---
+# ── Falco Helm values ─────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-helm-values-reference
+  namespace: security
+  annotations:
+    note: "helm upgrade --install falco falcosecurity/falco -n security -f falco-values.yaml"
+data:
+  falco-values.yaml: |
+    driver:
+      kind: ebpf    # eBPF is preferred — no kernel module, better compatibility
+
+    falco:
+      grpc:
+        enabled: true
+      grpc_output:
+        enabled: true
+
+    falcosidekick:
+      enabled: true
+      config:
+        slack:
+          webhookurl: ""   # Set from secret
+          channel: "#security-alerts"
+          minimumpriority: "warning"
+
+        # Forward to Alertmanager for SLO-aware routing
+        alertmanager:
+          hostport: "http://alertmanager.observability.svc.cluster.local:9093"
+          minimumpriority: "critical"
+
+        # Webhook to Argo Events for automated response
+        webhook:
+          address: "http://alertmanager-webhook-eventsource-svc.argo.svc.cluster.local:12000/security-alert"
+          minimumpriority: "critical"
+
+      webui:
+        enabled: true
+
+    nodeSelector:
+      # Falco runs as DaemonSet — all nodes
+    tolerations:
+      - operator: Exists   # Run on all nodes including tainted ones
